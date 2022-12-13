@@ -524,6 +524,20 @@ pub const StringHashMapContext = struct {
     pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
         return strings.eqlLong(a, b, true);
     }
+
+    pub const Prehashed = struct {
+        value: u64,
+        input: []const u8,
+        pub fn hash(this: @This(), s: []const u8) u64 {
+            if (s.ptr == this.input.ptr and s.len == this.input.len)
+                return this.value;
+            return std.hash.Wyhash.hash(0, s);
+        }
+
+        pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+            return strings.eqlLong(a, b, true);
+        }
+    };
 };
 
 pub fn StringArrayHashMap(comptime Type: type) type {
@@ -545,3 +559,7 @@ pub fn StringHashMapUnmanaged(comptime Type: type) type {
 const CopyFile = @import("./copy_file.zig");
 pub const copyFileRange = CopyFile.copyFileRange;
 pub const copyFile = CopyFile.copyFile;
+
+pub fn parseDouble(input: []const u8) !f64 {
+    return JSC.WTF.parseDouble(input);
+}

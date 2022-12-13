@@ -11,7 +11,6 @@ pub const RuntimeImports = _runtime.Runtime.Imports;
 pub const RuntimeFeatures = _runtime.Runtime.Features;
 pub const RuntimeNames = _runtime.Runtime.Names;
 pub const fs = @import("./fs.zig");
-const _hash_map = @import("./hash_map.zig");
 const bun = @import("bun");
 const string = bun.string;
 const Output = bun.Output;
@@ -65,12 +64,16 @@ pub const Op = js_ast.Op;
 pub const Scope = js_ast.Scope;
 pub const locModuleScope = logger.Loc{ .start = -100 };
 const Ref = @import("./ast/base.zig").Ref;
+const RefHashCtx = @import("./ast/base.zig").RefHashCtx;
 
-pub const StringHashMap = _hash_map.StringHashMap;
-pub const AutoHashMap = _hash_map.AutoHashMap;
-const StringHashMapUnamanged = _hash_map.StringHashMapUnamanged;
+pub const StringHashMap = bun.StringHashMap;
+pub const AutoHashMap = bun.AutoHashMap;
+const StringHashMapUnamanged = bun.StringHashMapUnmanaged;
 const ObjectPool = @import("./pool.zig").ObjectPool;
 const NodeFallbackModules = @import("./node_fallbacks.zig");
+
+const RefExprMap = std.ArrayHashMapUnmanaged(Ref, Expr, RefHashCtx, false);
+
 // Dear reader,
 // There are some things you should know about this file to make it easier for humans to read
 // "P" is the internal parts of the parser
@@ -103,6 +106,12 @@ pub const AllocatedNamesPool = ObjectPool(
     true,
     4,
 );
+
+const Substitution = union(enum) {
+    success: Expr,
+    failure: Expr,
+    continue_: Expr,
+};
 
 fn foldStringAddition(lhs: Expr, rhs: Expr) ?Expr {
     switch (lhs.data) {
@@ -1701,6 +1710,34 @@ pub const SideEffects = enum(u1) {
                             return result;
                         }
                     },
+                    .bin_gt => {
+                        if (e_.left.data.toFiniteNumber()) |left_num| {
+                            if (e_.right.data.toFiniteNumber()) |right_num| {
+                                return Result{ .ok = true, .value = left_num > right_num, .side_effects = .no_side_effects };
+                            }
+                        }
+                    },
+                    .bin_lt => {
+                        if (e_.left.data.toFiniteNumber()) |left_num| {
+                            if (e_.right.data.toFiniteNumber()) |right_num| {
+                                return Result{ .ok = true, .value = left_num < right_num, .side_effects = .no_side_effects };
+                            }
+                        }
+                    },
+                    .bin_le => {
+                        if (e_.left.data.toFiniteNumber()) |left_num| {
+                            if (e_.right.data.toFiniteNumber()) |right_num| {
+                                return Result{ .ok = true, .value = left_num <= right_num, .side_effects = .no_side_effects };
+                            }
+                        }
+                    },
+                    .bin_ge => {
+                        if (e_.left.data.toFiniteNumber()) |left_num| {
+                            if (e_.right.data.toFiniteNumber()) |right_num| {
+                                return Result{ .ok = true, .value = left_num >= right_num, .side_effects = .no_side_effects };
+                            }
+                        }
+                    },
                     else => {},
                 }
             },
@@ -1902,7 +1939,7 @@ const StrictModeFeature = enum {
     if_else_function_stmt,
 };
 
-const Map = _hash_map.AutoHashMapUnmanaged;
+const Map = std.AutoHashMapUnmanaged;
 
 const List = std.ArrayListUnmanaged;
 const ListManaged = std.ArrayList;
@@ -3088,7 +3125,7 @@ pub const Parser = struct {
             const had_require = p.runtime_imports.contains("__require");
             p.resolveCommonJSSymbols();
 
-            const copy_of_runtime_require = p.runtime_imports.__require.?;
+            const copy_of_runtime_require = p.runtime_imports.__require;
             if (!had_require) {
                 p.runtime_imports.__require = null;
             }
@@ -3579,7 +3616,7 @@ fn NewParser_(
         should_fold_numeric_constants: bool = false,
         emitted_namespace_vars: RefMap = RefMap{},
         is_exported_inside_namespace: RefRefMap = .{},
-        known_enum_values: Map(Ref, _hash_map.StringHashMapUnmanaged(f64)) = .{},
+        known_enum_values: Map(Ref, StringHashMapUnamanged(f64)) = .{},
         local_type_names: StringBoolMap = StringBoolMap{},
 
         // This is the reference to the generated function argument for the namespace,
@@ -3662,6 +3699,9 @@ fn NewParser_(
         loop_body: Stmt.Data,
         module_scope: *js_ast.Scope = undefined,
         is_control_flow_dead: bool = false,
+
+        /// We must be careful to avoid revisiting nodes that have scopes.
+        is_revisit_for_substitution: bool = false,
 
         // Inside a TypeScript namespace, an "export declare" statement can be used
         // to cause a namespace to be emitted even though it has no other observable
@@ -3767,7 +3807,7 @@ fn NewParser_(
 
         scope_order_to_visit: []ScopeOrder = &([_]ScopeOrder{}),
 
-        import_refs_to_always_trim_if_unused: RefArrayMap = .{},
+        const_values: RefExprMap = .{},
 
         pub fn transposeImport(p: *P, arg: Expr, state: anytype) Expr {
             // The argument must be a string
@@ -4214,7 +4254,7 @@ fn NewParser_(
             // This function can show up in profiling.
             // That's part of why we do this.
             // Instead of rehashing `name` for every scope, we do it just once.
-            const hash = @TypeOf(p.module_scope.members).getHash(name);
+            const hash = Scope.getMemberHash(name);
             const allocator = p.allocator;
 
             const ref: Ref = brk: {
@@ -4237,7 +4277,7 @@ fn NewParser_(
                     }
 
                     // Is the symbol a member of this scope?
-                    if (scope.members.getWithHash(name, hash)) |member| {
+                    if (scope.getMemberWithHash(name, hash)) |member| {
                         declare_loc = member.loc;
                         break :brk member.ref;
                     }
@@ -4245,9 +4285,21 @@ fn NewParser_(
 
                 // Allocate an "unbound" symbol
                 p.checkForNonBMPCodePoint(loc, name);
+                var gpe = p.module_scope.getOrPutMemberWithHash(allocator, name, hash) catch unreachable;
+
+                // I don't think this happens?
+                if (gpe.found_existing) {
+                    const existing = gpe.value_ptr.*;
+                    declare_loc = existing.loc;
+                    break :brk existing.ref;
+                }
+
                 const _ref = p.newSymbol(.unbound, name) catch unreachable;
+
+                gpe.key_ptr.* = name;
+                gpe.value_ptr.* = js_ast.Scope.Member{ .ref = _ref, .loc = loc };
+
                 declare_loc = loc;
-                p.module_scope.members.putWithHash(allocator, name, hash, js_ast.Scope.Member{ .ref = _ref, .loc = logger.Loc.Empty }) catch unreachable;
 
                 break :brk _ref;
             };
@@ -4321,6 +4373,7 @@ fn NewParser_(
         }
 
         pub fn recordUsage(p: *P, ref: Ref) void {
+            if (p.is_revisit_for_substitution) return;
             // The use count stored in the symbol is used for generating symbol names
             // during minification. These counts shouldn't include references inside dead
             // code regions since those will be culled.
@@ -4372,6 +4425,12 @@ fn NewParser_(
 
         pub fn handleIdentifier(p: *P, loc: logger.Loc, ident: E.Identifier, _original_name: ?string, opts: IdentifierOpts) Expr {
             const ref = ident.ref;
+
+            if (p.options.features.inlining) {
+                if (p.const_values.get(ref)) |replacement| {
+                    return replacement;
+                }
+            }
 
             if ((opts.assign_target != .none or opts.is_delete_target) and p.symbols.items[ref.innerIndex()].kind == .import) {
                 // Create an error for assigning to an import namespace
@@ -4488,6 +4547,494 @@ fn NewParser_(
             }) catch unreachable;
         }
 
+        fn substituteSingleUseSymbolInStmt(p: *P, stmt: Stmt, ref: Ref, replacement: Expr) bool {
+            var expr: *Expr = brk: {
+                switch (stmt.data) {
+                    .s_expr => |exp| {
+                        break :brk &exp.value;
+                    },
+                    .s_throw => |throw| {
+                        break :brk &throw.value;
+                    },
+                    .s_return => |ret| {
+                        if (ret.value) |*value| {
+                            break :brk value;
+                        }
+                    },
+                    .s_if => |if_stmt| {
+                        break :brk &if_stmt.test_;
+                    },
+                    .s_switch => |switch_stmt| {
+                        break :brk &switch_stmt.test_;
+                    },
+                    .s_local => |local| {
+                        if (local.decls.len > 0) {
+                            var first: *Decl = &local.decls[0];
+                            if (first.value) |*value| {
+                                if (first.binding.data == .b_identifier) {
+                                    break :brk value;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+
+                return false;
+            };
+
+            // Only continue trying to insert this replacement into sub-expressions
+            // after the first one if the replacement has no side effects:
+            //
+            //   // Substitution is ok
+            //   let replacement = 123;
+            //   return x + replacement;
+            //
+            //   // Substitution is not ok because "fn()" may change "x"
+            //   let replacement = fn();
+            //   return x + replacement;
+            //
+            //   // Substitution is not ok because "x == x" may change "x" due to "valueOf()" evaluation
+            //   let replacement = [x];
+            //   return (x == x) + replacement;
+            //
+            const replacement_can_be_removed = p.exprCanBeRemovedIfUnused(&replacement);
+            switch (p.substituteSingleUseSymbolInExpr(expr.*, ref, replacement, replacement_can_be_removed)) {
+                .success => |result| {
+                    if (result.data == .e_binary or result.data == .e_unary or result.data == .e_if) {
+                        const prev_substituting = p.is_revisit_for_substitution;
+                        p.is_revisit_for_substitution = true;
+                        defer p.is_revisit_for_substitution = prev_substituting;
+                        // O(n^2) and we will need to think more carefully about
+                        // this once we implement syntax compression
+                        expr.* = p.visitExpr(result);
+                    } else {
+                        expr.* = result;
+                    }
+
+                    return true;
+                },
+                else => {},
+            }
+
+            return false;
+        }
+
+        fn substituteSingleUseSymbolInExpr(
+            p: *P,
+            expr: Expr,
+            ref: Ref,
+            replacement: Expr,
+            replacement_can_be_removed: bool,
+        ) Substitution {
+            outer: {
+                switch (expr.data) {
+                    .e_identifier => |ident| {
+                        if (ident.ref.eql(ref) or p.symbols.items[ident.ref.innerIndex()].link.eql(ref)) {
+                            p.ignoreUsage(ref);
+                            return .{ .success = replacement };
+                        }
+                    },
+                    .e_new => |new| {
+                        switch (p.substituteSingleUseSymbolInExpr(new.target, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                new.target = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                new.target = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+
+                        if (replacement_can_be_removed) {
+                            for (new.args.slice()) |*arg| {
+                                switch (p.substituteSingleUseSymbolInExpr(arg.*, ref, replacement, replacement_can_be_removed)) {
+                                    .continue_ => {},
+                                    .success => |result| {
+                                        arg.* = result;
+                                        return .{ .success = expr };
+                                    },
+                                    .failure => |result| {
+                                        arg.* = result;
+                                        return .{ .failure = expr };
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    .e_spread => |spread| {
+                        switch (p.substituteSingleUseSymbolInExpr(spread.value, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                spread.value = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                spread.value = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+                    },
+                    .e_await => |await_expr| {
+                        switch (p.substituteSingleUseSymbolInExpr(await_expr.value, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                await_expr.value = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                await_expr.value = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+                    },
+                    .e_yield => |yield| {
+                        switch (p.substituteSingleUseSymbolInExpr(yield.value orelse Expr{ .data = .{ .e_missing = .{} }, .loc = expr.loc }, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                yield.value = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                yield.value = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+                    },
+                    .e_import => |import| {
+                        switch (p.substituteSingleUseSymbolInExpr(import.expr, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                import.expr = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                import.expr = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+
+                        // The "import()" expression has side effects but the side effects are
+                        // always asynchronous so there is no way for the side effects to modify
+                        // the replacement value. So it's ok to reorder the replacement value
+                        // past the "import()" expression assuming everything else checks out.
+
+                        if (replacement_can_be_removed and p.exprCanBeRemovedIfUnused(&import.expr)) {
+                            return .{ .continue_ = expr };
+                        }
+                    },
+                    .e_unary => |e| {
+                        switch (e.op) {
+                            .un_pre_inc, .un_post_inc, .un_pre_dec, .un_post_dec, .un_delete => {
+                                // Do not substitute into an assignment position
+                            },
+                            else => {
+                                switch (p.substituteSingleUseSymbolInExpr(e.value, ref, replacement, replacement_can_be_removed)) {
+                                    .continue_ => {},
+                                    .success => |result| {
+                                        e.value = result;
+                                        return .{ .success = expr };
+                                    },
+                                    .failure => |result| {
+                                        e.value = result;
+                                        return .{ .failure = expr };
+                                    },
+                                }
+                            },
+                        }
+                    },
+                    .e_dot => |e| {
+                        switch (p.substituteSingleUseSymbolInExpr(e.target, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                e.target = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                e.target = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+                    },
+                    .e_binary => |e| {
+                        // Do not substitute into an assignment position
+                        if (e.op.binaryAssignTarget() == .none) {
+                            switch (p.substituteSingleUseSymbolInExpr(e.left, ref, replacement, replacement_can_be_removed)) {
+                                .continue_ => {},
+                                .success => |result| {
+                                    e.left = result;
+
+                                    return .{ .success = expr };
+                                },
+                                .failure => |result| {
+                                    e.left = result;
+                                    return .{ .failure = expr };
+                                },
+                            }
+                        } else if (!p.exprCanBeRemovedIfUnused(&e.left)) {
+                            // Do not reorder past a side effect in an assignment target, as that may
+                            // change the replacement value. For example, "fn()" may change "a" here:
+                            //
+                            //   let a = 1;
+                            //   foo[fn()] = a;
+                            //
+                            return .{ .failure = expr };
+                        } else if (e.op.binaryAssignTarget() == .update and !replacement_can_be_removed) {
+                            // If this is a read-modify-write assignment and the replacement has side
+                            // effects, don't reorder it past the assignment target. The assignment
+                            // target is being read so it may be changed by the side effect. For
+                            // example, "fn()" may change "foo" here:
+                            //
+                            //   let a = fn();
+                            //   foo += a;
+                            //
+                            return .{ .failure = expr };
+                        }
+
+                        // If we get here then it should be safe to attempt to substitute the
+                        // replacement past the left operand into the right operand.
+                        switch (p.substituteSingleUseSymbolInExpr(e.right, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                e.right = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                e.right = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+                    },
+                    .e_if => |e| {
+                        switch (p.substituteSingleUseSymbolInExpr(expr.data.e_if.test_, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                e.test_ = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                e.test_ = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+
+                        // Do not substitute our unconditionally-executed value into a branch
+                        // unless the value itself has no side effects
+                        if (replacement_can_be_removed) {
+                            // Unlike other branches in this function such as "a && b" or "a?.[b]",
+                            // the "a ? b : c" form has potential code evaluation along both control
+                            // flow paths. Handle this by allowing substitution into either branch.
+                            // Side effects in one branch should not prevent the substitution into
+                            // the other branch.
+
+                            const yes = p.substituteSingleUseSymbolInExpr(e.yes, ref, replacement, replacement_can_be_removed);
+                            if (yes == .success) {
+                                e.yes = yes.success;
+                                return .{ .success = expr };
+                            }
+
+                            const no = p.substituteSingleUseSymbolInExpr(e.no, ref, replacement, replacement_can_be_removed);
+                            if (no == .success) {
+                                e.no = no.success;
+                                return .{ .success = expr };
+                            }
+
+                            // Side effects in either branch should stop us from continuing to try to
+                            // substitute the replacement after the control flow branches merge again.
+                            if (yes != .continue_ or no != .continue_) {
+                                return .{ .failure = expr };
+                            }
+                        }
+                    },
+                    .e_index => |index| {
+                        switch (p.substituteSingleUseSymbolInExpr(index.target, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                index.target = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                index.target = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+
+                        // Do not substitute our unconditionally-executed value into a branch
+                        // unless the value itself has no side effects
+                        if (replacement_can_be_removed or index.optional_chain == null) {
+                            switch (p.substituteSingleUseSymbolInExpr(index.index, ref, replacement, replacement_can_be_removed)) {
+                                .continue_ => {},
+                                .success => |result| {
+                                    index.index = result;
+                                    return .{ .success = expr };
+                                },
+                                .failure => |result| {
+                                    index.index = result;
+                                    return .{ .failure = expr };
+                                },
+                            }
+                        }
+                    },
+
+                    .e_call => |e| {
+                        // Don't substitute something into a call target that could change "this"
+                        switch (replacement.data) {
+                            .e_dot, .e_index => {
+                                if (e.target.data == .e_identifier and e.target.data.e_identifier.ref.eql(ref)) {
+                                    break :outer;
+                                }
+                            },
+                            else => {},
+                        }
+
+                        switch (p.substituteSingleUseSymbolInExpr(e.target, ref, replacement, replacement_can_be_removed)) {
+                            .continue_ => {},
+                            .success => |result| {
+                                e.target = result;
+                                return .{ .success = expr };
+                            },
+                            .failure => |result| {
+                                e.target = result;
+                                return .{ .failure = expr };
+                            },
+                        }
+
+                        // Do not substitute our unconditionally-executed value into a branch
+                        // unless the value itself has no side effects
+                        if (replacement_can_be_removed or e.optional_chain == null) {
+                            for (e.args.slice()) |*arg| {
+                                switch (p.substituteSingleUseSymbolInExpr(arg.*, ref, replacement, replacement_can_be_removed)) {
+                                    .continue_ => {},
+                                    .success => |result| {
+                                        arg.* = result;
+                                        return .{ .success = expr };
+                                    },
+                                    .failure => |result| {
+                                        arg.* = result;
+                                        return .{ .failure = expr };
+                                    },
+                                }
+                            }
+                        }
+                    },
+
+                    .e_array => |e| {
+                        for (e.items.slice()) |*item| {
+                            switch (p.substituteSingleUseSymbolInExpr(item.*, ref, replacement, replacement_can_be_removed)) {
+                                .continue_ => {},
+                                .success => |result| {
+                                    item.* = result;
+                                    return .{ .success = expr };
+                                },
+                                .failure => |result| {
+                                    item.* = result;
+                                    return .{ .failure = expr };
+                                },
+                            }
+                        }
+                    },
+
+                    .e_object => |e| {
+                        for (e.properties.slice()) |*property| {
+                            // Check the key
+
+                            if (property.flags.contains(.is_computed)) {
+                                switch (p.substituteSingleUseSymbolInExpr(property.key.?, ref, replacement, replacement_can_be_removed)) {
+                                    .continue_ => {},
+                                    .success => |result| {
+                                        property.key = result;
+                                        return .{ .success = expr };
+                                    },
+                                    .failure => |result| {
+                                        property.key = result;
+                                        return .{ .failure = expr };
+                                    },
+                                }
+
+                                // Stop now because both computed keys and property spread have side effects
+                                return .{ .failure = expr };
+                            }
+
+                            // Check the value
+                            if (property.value) |value| {
+                                switch (p.substituteSingleUseSymbolInExpr(value, ref, replacement, replacement_can_be_removed)) {
+                                    .continue_ => {},
+                                    .success => |result| {
+                                        if (result.data == .e_missing) {
+                                            property.value = null;
+                                        } else {
+                                            property.value = result;
+                                        }
+                                        return .{ .success = expr };
+                                    },
+                                    .failure => |result| {
+                                        if (result.data == .e_missing) {
+                                            property.value = null;
+                                        } else {
+                                            property.value = result;
+                                        }
+                                        return .{ .failure = expr };
+                                    },
+                                }
+                            }
+                        }
+                    },
+
+                    .e_template => |e| {
+                        if (e.tag) |*tag| {
+                            switch (p.substituteSingleUseSymbolInExpr(tag.*, ref, replacement, replacement_can_be_removed)) {
+                                .continue_ => {},
+                                .success => |result| {
+                                    tag.* = result;
+                                    return .{ .success = expr };
+                                },
+                                .failure => |result| {
+                                    tag.* = result;
+                                    return .{ .failure = expr };
+                                },
+                            }
+                        }
+
+                        for (e.parts) |*part| {
+                            switch (p.substituteSingleUseSymbolInExpr(part.value, ref, replacement, replacement_can_be_removed)) {
+                                .continue_ => {},
+                                .success => |result| {
+                                    part.value = result;
+
+                                    // todo: mangle template parts
+
+                                    return .{ .success = expr };
+                                },
+                                .failure => |result| {
+                                    part.value = result;
+                                    return .{ .failure = expr };
+                                },
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            // If both the replacement and this expression have no observable side
+            // effects, then we can reorder the replacement past this expression
+            if (replacement_can_be_removed and p.exprCanBeRemovedIfUnused(&expr)) {
+                return .{ .continue_ = expr };
+            }
+
+            const tag: Expr.Tag = @as(Expr.Tag, expr.data);
+
+            // We can always reorder past primitive values
+            if (tag.isPrimitiveLiteral()) {
+                return .{ .continue_ = expr };
+            }
+
+            // Otherwise we should stop trying to substitute past this point
+            return .{ .failure = expr };
+        }
+
         pub fn prepareForVisitPass(p: *P) !void {
             {
                 var count: usize = 0;
@@ -4544,7 +5091,7 @@ fn NewParser_(
             }
 
             try p.module_scope.generated.ensureUnusedCapacity(p.allocator, generated_symbols_count * 3);
-            try p.module_scope.members.ensureCapacity(p.allocator, generated_symbols_count * 3 + p.module_scope.members.count());
+            try p.module_scope.members.ensureUnusedCapacity(p.allocator, generated_symbols_count * 3 + p.module_scope.members.count());
 
             p.exports_ref = try p.declareCommonJSSymbol(.hoisted, "exports");
             p.module_ref = try p.declareCommonJSSymbol(.hoisted, "module");
@@ -4657,7 +5204,8 @@ fn NewParser_(
             if (p.runtime_imports.__require) |*require| {
                 p.resolveGeneratedSymbol(require);
             }
-            p.ensureRequireSymbol();
+            if (p.options.features.allow_runtime)
+                p.ensureRequireSymbol();
         }
 
         pub fn resolveBundlingSymbols(p: *P) void {
@@ -4704,86 +5252,112 @@ fn NewParser_(
             if (!scope.kindStopsHoisting()) {
                 var iter = scope.members.iterator();
                 const allocator = p.allocator;
-                nextMember: while (iter.next()) |res| {
-                    var symbol = &p.symbols.items[res.value.ref.innerIndex()];
-                    if (!symbol.isHoisted()) {
-                        continue :nextMember;
+                var symbols = p.symbols.items;
+                const orig_capacity = p.symbols.capacity;
+                // assert we don't modify the symbols array while iterating
+                defer {
+                    if (comptime Environment.allow_assert) {
+                        assert(orig_capacity == p.symbols.capacity);
+                        assert(symbols.ptr == p.symbols.items.ptr);
                     }
+                }
 
-                    // Check for collisions that would prevent to hoisting "var" symbols up to the enclosing function scope
-                    var __scope = scope.parent;
-
-                    var hash: u64 = undefined;
-                    if (__scope) |_scope| {
-                        hash = @TypeOf(_scope.members).getHash(symbol.original_name);
-                    }
-
-                    while (__scope) |_scope| {
-                        // Variable declarations hoisted past a "with" statement may actually end
-                        // up overwriting a property on the target of the "with" statement instead
-                        // of initializing the variable. We must not rename them or we risk
-                        // causing a behavior change.
-                        //
-                        //   var obj = { foo: 1 }
-                        //   with (obj) { var foo = 2 }
-                        //   assert(foo === undefined)
-                        //   assert(obj.foo === 2)
-                        //
-                        if (_scope.kind == .with) {
-                            symbol.must_not_be_renamed = true;
+                // Check for collisions that would prevent to hoisting "var" symbols up to the enclosing function scope
+                if (scope.parent != null) {
+                    nextMember: while (iter.next()) |res| {
+                        const value = res.value_ptr.*;
+                        var symbol: *Symbol = &symbols[value.ref.innerIndex()];
+                        if (!symbol.isHoisted()) {
+                            continue :nextMember;
                         }
 
-                        if (_scope.members.getEntryWithHash(symbol.original_name, hash)) |existing_member_entry| {
-                            const existing_member = &existing_member_entry.value;
-                            const existing_symbol: *const Symbol = &p.symbols.items[existing_member.ref.innerIndex()];
+                        var __scope = scope.parent;
+                        assert(__scope != null);
+                        const name = symbol.original_name;
 
-                            // We can hoist the symbol from the child scope into the symbol in
-                            // this scope if:
+                        const hash: u64 = Scope.getMemberHash(name);
+
+                        while (__scope) |_scope| {
+                            const scope_kind = _scope.kind;
+
+                            // Variable declarations hoisted past a "with" statement may actually end
+                            // up overwriting a property on the target of the "with" statement instead
+                            // of initializing the variable. We must not rename them or we risk
+                            // causing a behavior change.
                             //
-                            //   - The symbol is unbound (i.e. a global variable access)
-                            //   - The symbol is also another hoisted variable
-                            //   - The symbol is a function of any kind and we're in a function or module scope
+                            //   var obj = { foo: 1 }
+                            //   with (obj) { var foo = 2 }
+                            //   assert(foo === undefined)
+                            //   assert(obj.foo === 2)
                             //
-                            // Is this unbound (i.e. a global access) or also hoisted?
-                            if (existing_symbol.kind == .unbound or existing_symbol.kind == .hoisted or
-                                (Symbol.isKindFunction(existing_symbol.kind) and (_scope.kind == .entry or _scope.kind == .function_body)))
-                            {
-                                // Silently merge this symbol into the existing symbol
-                                symbol.link = existing_member.ref;
-                                continue :nextMember;
+                            if (scope_kind == .with) {
+                                symbol.must_not_be_renamed = true;
                             }
 
-                            // Otherwise if this isn't a catch identifier, it's a collision
-                            if (existing_symbol.kind != .catch_identifier) {
+                            if (_scope.getMemberWithHash(name, hash)) |member_in_scope| {
+                                var existing_symbol: *Symbol = &symbols[member_in_scope.ref.innerIndex()];
+                                const existing_kind = existing_symbol.kind;
+
+                                // We can hoist the symbol from the child scope into the symbol in
+                                // this scope if:
+                                //
+                                //   - The symbol is unbound (i.e. a global variable access)
+                                //   - The symbol is also another hoisted variable
+                                //   - The symbol is a function of any kind and we're in a function or module scope
+                                //
+                                // Is this unbound (i.e. a global access) or also hoisted?
+                                if (existing_kind == .unbound or existing_kind == .hoisted or
+                                    (Symbol.isKindFunction(existing_kind) and (scope_kind == .entry or scope_kind == .function_body)))
+                                {
+                                    // Silently merge this symbol into the existing symbol
+                                    symbol.link = member_in_scope.ref;
+                                    var entry = _scope.getOrPutMemberWithHash(p.allocator, name, hash) catch unreachable;
+                                    entry.value_ptr.* = value;
+                                    entry.key_ptr.* = name;
+                                    continue :nextMember;
+                                }
 
                                 // An identifier binding from a catch statement and a function
                                 // declaration can both silently shadow another hoisted symbol
-                                if (symbol.kind != .catch_identifier and symbol.kind != .hoisted_function) {
-                                    const r = js_lexer.rangeOfIdentifier(p.source, res.value.loc);
-                                    var notes = allocator.alloc(logger.Data, 1) catch unreachable;
-                                    notes[0] =
-                                        logger.rangeData(
-                                        p.source,
-                                        r,
-                                        std.fmt.allocPrint(
-                                            allocator,
-                                            "{s} was originally declared here",
-                                            .{existing_symbol.original_name},
-                                        ) catch unreachable,
-                                    );
 
-                                    p.log.addRangeErrorFmtWithNotes(p.source, js_lexer.rangeOfIdentifier(p.source, existing_member_entry.value.loc), allocator, notes, "{s} has already been declared", .{symbol.original_name}) catch unreachable;
+                                // Otherwise if this isn't a catch identifier, it's a collision
+                                if (existing_kind != .catch_identifier and existing_kind != .arguments) {
+
+                                    // An identifier binding from a catch statement and a function
+                                    // declaration can both silently shadow another hoisted symbol
+                                    if (symbol.kind != .catch_identifier and symbol.kind != .hoisted_function) {
+                                        const r = js_lexer.rangeOfIdentifier(p.source, value.loc);
+                                        var notes = allocator.alloc(logger.Data, 1) catch unreachable;
+                                        notes[0] =
+                                            logger.rangeData(
+                                            p.source,
+                                            r,
+                                            std.fmt.allocPrint(
+                                                allocator,
+                                                "{s} was originally declared here",
+                                                .{name},
+                                            ) catch unreachable,
+                                        );
+
+                                        p.log.addRangeErrorFmtWithNotes(p.source, js_lexer.rangeOfIdentifier(p.source, member_in_scope.loc), allocator, notes, "{s} has already been declared", .{name}) catch unreachable;
+                                        continue :nextMember;
+                                    }
+
+                                    // If this is a catch identifier, silently merge the existing symbol
+                                    // into this symbol but continue hoisting past this catch scope
+                                    existing_symbol.link = member_in_scope.ref;
                                 }
-
-                                continue :nextMember;
                             }
-                        }
 
-                        if (_scope.kindStopsHoisting()) {
-                            _scope.members.putWithHash(allocator, symbol.original_name, hash, res.value) catch unreachable;
-                            break;
+                            if (_scope.kindStopsHoisting()) {
+                                var entry = _scope.getOrPutMemberWithHash(allocator, name, hash) catch unreachable;
+                                entry.value_ptr.* = value;
+                                entry.key_ptr.* = name;
+                                break;
+                            }
+
+                            __scope = _scope.parent;
                         }
-                        __scope = _scope.parent;
                     }
                 }
             }
@@ -4861,11 +5435,12 @@ fn NewParser_(
 
                 var iter = scope.parent.?.members.iterator();
                 while (iter.next()) |entry| {
-                    // 	// Don't copy down the optional function expression name. Re-declaring
-                    // 	// the name of a function expression is allowed.
-                    const adjacent_kind = p.symbols.items[entry.value.ref.innerIndex()].kind;
+                    // Don't copy down the optional function expression name. Re-declaring
+                    // the name of a function expression is allowed.
+                    const value = entry.value_ptr.*;
+                    const adjacent_kind = p.symbols.items[value.ref.innerIndex()].kind;
                     if (adjacent_kind != .hoisted_function) {
-                        try scope.members.put(allocator, entry.key, entry.value);
+                        try scope.members.put(allocator, entry.key_ptr.*, value);
                     }
                 }
             }
@@ -8847,8 +9422,8 @@ fn NewParser_(
         }
 
         pub fn declareCommonJSSymbol(p: *P, comptime kind: Symbol.Kind, comptime name: string) !Ref {
-            const name_hash = comptime @TypeOf(p.module_scope.members).getHash(name);
-            const member = p.module_scope.members.getWithHash(name, name_hash);
+            const name_hash = comptime Scope.getMemberHash(name);
+            const member = p.module_scope.getMemberWithHash(name, name_hash);
 
             // If the code declared this symbol using "var name", then this is actually
             // not a collision. For example, node will let you do this:
@@ -8878,7 +9453,7 @@ fn NewParser_(
             const ref = try p.newSymbol(kind, name);
 
             if (member == null) {
-                try p.module_scope.members.putWithHash(p.allocator, name, name_hash, Scope.Member{ .ref = ref, .loc = logger.Loc.Empty });
+                try p.module_scope.members.put(p.allocator, name, Scope.Member{ .ref = ref, .loc = logger.Loc.Empty });
                 return ref;
             }
 
@@ -8920,7 +9495,7 @@ fn NewParser_(
             const scope = p.current_scope;
             var entry = try scope.members.getOrPut(p.allocator, name);
             if (entry.found_existing) {
-                const existing = entry.entry.value;
+                const existing = entry.value_ptr.*;
                 var symbol: *Symbol = &p.symbols.items[existing.ref.innerIndex()];
 
                 if (comptime !is_generated) {
@@ -8976,8 +9551,8 @@ fn NewParser_(
                     p.symbols.items[ref.innerIndex()].link = existing.ref;
                 }
             }
-
-            entry.entry.value = js_ast.Scope.Member{ .ref = ref, .loc = loc };
+            entry.key_ptr.* = name;
+            entry.value_ptr.* = js_ast.Scope.Member{ .ref = ref, .loc = loc };
             if (comptime is_generated) {
                 try p.module_scope.generated.append(p.allocator, ref);
             }
@@ -9455,7 +10030,7 @@ fn NewParser_(
                     //     continue;
                     // }
 
-                    p.symbols.items[member.value.ref.innerIndex()].must_not_be_renamed = true;
+                    p.symbols.items[member.value_ptr.ref.innerIndex()].must_not_be_renamed = true;
                 }
             }
 
@@ -13197,7 +13772,7 @@ fn NewParser_(
                             // notimpl();
                         },
                         .bin_loose_eq => {
-                            const equality = e_.left.data.eql(e_.right.data);
+                            const equality = e_.left.data.eql(e_.right.data, p.allocator);
                             if (equality.ok) {
                                 return p.e(
                                     E.Boolean{ .value = equality.equal },
@@ -13211,7 +13786,7 @@ fn NewParser_(
 
                         },
                         .bin_strict_eq => {
-                            const equality = e_.left.data.eql(e_.right.data);
+                            const equality = e_.left.data.eql(e_.right.data, p.allocator);
                             if (equality.ok) {
                                 return p.e(E.Boolean{ .value = equality.equal }, expr.loc);
                             }
@@ -13221,7 +13796,7 @@ fn NewParser_(
                             // TODO: warn about typeof string
                         },
                         .bin_loose_ne => {
-                            const equality = e_.left.data.eql(e_.right.data);
+                            const equality = e_.left.data.eql(e_.right.data, p.allocator);
                             if (equality.ok) {
                                 return p.e(E.Boolean{ .value = !equality.equal }, expr.loc);
                             }
@@ -13235,7 +13810,7 @@ fn NewParser_(
                             }
                         },
                         .bin_strict_ne => {
-                            const equality = e_.left.data.eql(e_.right.data);
+                            const equality = e_.left.data.eql(e_.right.data, p.allocator);
                             if (equality.ok) {
                                 return p.e(E.Boolean{ .value = !equality.equal }, expr.loc);
                             }
@@ -14098,6 +14673,10 @@ fn NewParser_(
                     }
                 },
                 .e_arrow => |e_| {
+                    if (p.is_revisit_for_substitution) {
+                        return expr;
+                    }
+
                     const old_fn_or_arrow_data = std.mem.toBytes(p.fn_or_arrow_data_visit);
                     p.fn_or_arrow_data_visit = FnOrArrowDataVisit{
                         .is_arrow = true,
@@ -14133,12 +14712,19 @@ fn NewParser_(
                     p.fn_or_arrow_data_visit = std.mem.bytesToValue(@TypeOf(p.fn_or_arrow_data_visit), &old_fn_or_arrow_data);
                 },
                 .e_function => |e_| {
+                    if (p.is_revisit_for_substitution) {
+                        return expr;
+                    }
+
                     e_.func = p.visitFunc(e_.func, expr.loc);
                     if (e_.func.name) |name| {
                         return p.keepExprSymbolName(expr, p.symbols.items[name.ref.?.innerIndex()].original_name);
                     }
                 },
                 .e_class => |e_| {
+                    if (p.is_revisit_for_substitution) {
+                        return expr;
+                    }
 
                     // This might be wrong.
                     _ = p.visitClass(expr.loc, e_);
@@ -14839,6 +15425,10 @@ fn NewParser_(
                 .e_string => |str| {
                     // minify "long-string".length to 11
                     if (strings.eqlComptime(name, "length")) {
+                        // don't handle UTF-16 strings for now
+                        if (str.is_utf16)
+                            return null;
+
                         return p.e(E.Number{ .value = @intToFloat(f64, str.len()) }, loc);
                     }
                 },
@@ -14849,7 +15439,7 @@ fn NewParser_(
         }
 
         pub fn ignoreUsage(p: *P, ref: Ref) void {
-            if (!p.is_control_flow_dead) {
+            if (!p.is_control_flow_dead and !p.is_revisit_for_substitution) {
                 if (comptime Environment.allow_assert) assert(@as(usize, ref.innerIndex()) < p.symbols.items.len);
                 p.symbols.items[ref.innerIndex()].use_count_estimate -|= 1;
                 var use = p.symbol_uses.get(ref) orelse return;
@@ -14866,17 +15456,23 @@ fn NewParser_(
         }
 
         fn visitAndAppendStmt(p: *P, stmts: *ListManaged(Stmt), stmt: *Stmt) !void {
+            // By default any statement ends the const local prefix
+            const was_after_after_const_local_prefix = p.current_scope.is_after_const_local_prefix;
+            p.current_scope.is_after_const_local_prefix = true;
+
             switch (stmt.data) {
                 // These don't contain anything to traverse
 
-                .s_debugger, .s_empty, .s_comment => {},
+                .s_debugger, .s_empty, .s_comment => {
+                    p.current_scope.is_after_const_local_prefix = was_after_after_const_local_prefix;
+                },
                 .s_type_script => {
-
+                    p.current_scope.is_after_const_local_prefix = was_after_after_const_local_prefix;
                     // Erase TypeScript constructs from the output completely
                     return;
                 },
                 .s_directive => {
-
+                    p.current_scope.is_after_const_local_prefix = was_after_after_const_local_prefix;
                     //         	if p.isStrictMode() && s.LegacyOctalLoc.Start > 0 {
                     // 	p.markStrictModeFeature(legacyOctalEscape, p.source.RangeOfLegacyOctalEscape(s.LegacyOctalLoc), "")
                     // }
@@ -15306,10 +15902,12 @@ fn NewParser_(
                     p.popScope();
                 },
                 .s_local => |data| {
+                    // Local statements do not end the const local prefix
+                    p.current_scope.is_after_const_local_prefix = was_after_after_const_local_prefix;
                     const decls_len = if (!(data.is_export and p.options.features.replace_exports.entries.len > 0))
-                        p.visitDecls(data.decls, false)
+                        p.visitDecls(data.decls, data.kind == .k_const, false)
                     else
-                        p.visitDecls(data.decls, true);
+                        p.visitDecls(data.decls, data.kind == .k_const, true);
 
                     const is_now_dead = data.decls.len > 0 and decls_len == 0;
                     if (is_now_dead) {
@@ -15748,7 +16346,7 @@ fn NewParser_(
 
                     // Track values so they can be used by constant folding. We need to follow
                     // links here in case the enum was merged with a preceding namespace
-                    var values_so_far = _hash_map.StringHashMapUnmanaged(f64){};
+                    var values_so_far = StringHashMapUnamanged(f64){};
 
                     p.known_enum_values.put(allocator, data.name.ref orelse p.panic("Expected data.name.ref", .{}), values_so_far) catch unreachable;
                     p.known_enum_values.put(allocator, data.arg, values_so_far) catch unreachable;
@@ -15895,7 +16493,7 @@ fn NewParser_(
             return p.options.features.replace_exports.contains(symbol_name);
         }
 
-        fn visitDecls(p: *P, decls: []G.Decl, comptime is_possibly_decl_to_remove: bool) usize {
+        fn visitDecls(p: *P, decls: []G.Decl, was_const: bool, comptime is_possibly_decl_to_remove: bool) usize {
             var i: usize = 0;
             const count = decls.len;
             var j: usize = 0;
@@ -15939,6 +16537,7 @@ fn NewParser_(
                     p.visitDecl(
                         &decls[i],
                         was_anonymous_named_expr,
+                        was_const and !p.current_scope.is_after_const_local_prefix,
                         if (comptime allow_macros)
                             prev_macro_call_count != p.macro_call_count
                         else
@@ -15950,6 +16549,7 @@ fn NewParser_(
                             if (!p.replaceDeclAndPossiblyRemove(&decls[i], ptr)) {
                                 p.visitDecl(
                                     &decls[i],
+                                    was_const and !p.current_scope.is_after_const_local_prefix,
                                     false,
                                     false,
                                 );
@@ -16052,7 +16652,13 @@ fn NewParser_(
                                 if (object.asProperty(name)) |query| {
                                     switch (query.expr.data) {
                                         .e_object, .e_array => p.visitBindingAndExprForMacro(property.value, query.expr),
-                                        else => {},
+                                        else => {
+                                            if (p.options.features.inlining) {
+                                                if (property.value.data == .b_identifier) {
+                                                    p.const_values.put(p.allocator, property.value.data.b_identifier.ref, query.expr) catch unreachable;
+                                                }
+                                            }
+                                        },
                                     }
                                     output_properties[end] = output_properties[query.i];
                                     end += 1;
@@ -16082,14 +16688,28 @@ fn NewParser_(
                         }
                     }
                 },
+                .b_identifier => |id| {
+                    if (p.options.features.inlining) {
+                        p.const_values.put(p.allocator, id.ref, expr) catch unreachable;
+                    }
+                },
                 else => {},
             }
         }
 
-        fn visitDecl(p: *P, decl: *Decl, was_anonymous_named_expr: bool, could_be_macro: bool) void {
+        fn visitDecl(p: *P, decl: *Decl, was_anonymous_named_expr: bool, could_be_const_value: bool, could_be_macro: bool) void {
             // Optionally preserve the name
             switch (decl.binding.data) {
                 .b_identifier => |id| {
+                    if (could_be_const_value or (allow_macros and could_be_macro)) {
+                        if (decl.value != null) {
+                            if (decl.value.?.canBeConstValue()) {
+                                p.const_values.put(p.allocator, id.ref, decl.value.?) catch unreachable;
+                            }
+                        }
+                    } else {
+                        p.current_scope.is_after_const_local_prefix = true;
+                    }
                     decl.value = p.maybeKeepExprSymbolName(
                         decl.value.?,
                         p.symbols.items[id.ref.innerIndex()].original_name,
@@ -16871,157 +17491,159 @@ fn NewParser_(
                 class.extends = p.visitExpr(extends);
             }
 
-            p.pushScopeForVisitPass(.class_body, class.body_loc) catch unreachable;
-            defer {
-                p.popScope();
-                p.enclosing_class_keyword = old_enclosing_class_keyword;
-            }
-
-            var i: usize = 0;
-            var constructor_function: ?*E.Function = null;
-            while (i < class.properties.len) : (i += 1) {
-                var property = &class.properties[i];
-
-                if (property.kind == .class_static_block) {
-                    var old_fn_or_arrow_data = p.fn_or_arrow_data_visit;
-                    var old_fn_only_data = p.fn_only_data_visit;
-                    p.fn_or_arrow_data_visit = .{};
-                    p.fn_only_data_visit = .{ .is_this_nested = true, .is_new_target_allowed = true };
-
-                    p.pushScopeForVisitPass(.class_static_init, property.class_static_block.?.loc) catch unreachable;
-
-                    // Make it an error to use "arguments" in a static class block
-                    p.current_scope.forbid_arguments = true;
-
-                    var list = property.class_static_block.?.stmts.listManaged(p.allocator);
-                    p.visitStmts(&list, .fn_body) catch unreachable;
-                    property.class_static_block.?.stmts = js_ast.BabyList(Stmt).fromList(list);
+            {
+                p.pushScopeForVisitPass(.class_body, class.body_loc) catch unreachable;
+                defer {
                     p.popScope();
-
-                    p.fn_or_arrow_data_visit = old_fn_or_arrow_data;
-                    p.fn_only_data_visit = old_fn_only_data;
-
-                    continue;
-                }
-                property.ts_decorators = p.visitTSDecorators(property.ts_decorators);
-                const is_private = if (property.key != null) @as(Expr.Tag, property.key.?.data) == .e_private_identifier else false;
-
-                // Special-case EPrivateIdentifier to allow it here
-
-                if (is_private) {
-                    p.recordDeclaredSymbol(property.key.?.data.e_private_identifier.ref) catch unreachable;
-                } else if (property.key) |key| {
-                    class.properties[i].key = p.visitExpr(key);
+                    p.enclosing_class_keyword = old_enclosing_class_keyword;
                 }
 
-                // Make it an error to use "arguments" in a class body
-                p.current_scope.forbid_arguments = true;
-                defer p.current_scope.forbid_arguments = false;
+                var i: usize = 0;
+                var constructor_function: ?*E.Function = null;
+                while (i < class.properties.len) : (i += 1) {
+                    var property = &class.properties[i];
 
-                // The value of "this" is shadowed inside property values
-                const old_is_this_captured = p.fn_only_data_visit.is_this_nested;
-                const old_this = p.fn_only_data_visit.this_class_static_ref;
-                p.fn_only_data_visit.is_this_nested = true;
-                p.fn_only_data_visit.is_new_target_allowed = true;
-                p.fn_only_data_visit.this_class_static_ref = null;
-                defer p.fn_only_data_visit.is_this_nested = old_is_this_captured;
-                defer p.fn_only_data_visit.this_class_static_ref = old_this;
+                    if (property.kind == .class_static_block) {
+                        var old_fn_or_arrow_data = p.fn_or_arrow_data_visit;
+                        var old_fn_only_data = p.fn_only_data_visit;
+                        p.fn_or_arrow_data_visit = .{};
+                        p.fn_only_data_visit = .{ .is_this_nested = true, .is_new_target_allowed = true };
 
-                // We need to explicitly assign the name to the property initializer if it
-                // will be transformed such that it is no longer an inline initializer.
+                        p.pushScopeForVisitPass(.class_static_init, property.class_static_block.?.loc) catch unreachable;
 
-                var constructor_function_: ?*E.Function = null;
+                        // Make it an error to use "arguments" in a static class block
+                        p.current_scope.forbid_arguments = true;
 
-                var name_to_keep: ?string = null;
-                if (is_private) {} else if (!property.flags.contains(.is_method) and !property.flags.contains(.is_computed)) {
-                    if (property.key) |key| {
-                        if (@as(Expr.Tag, key.data) == .e_string) {
-                            name_to_keep = key.data.e_string.string(p.allocator) catch unreachable;
-                        }
+                        var list = property.class_static_block.?.stmts.listManaged(p.allocator);
+                        p.visitStmts(&list, .fn_body) catch unreachable;
+                        property.class_static_block.?.stmts = js_ast.BabyList(Stmt).fromList(list);
+                        p.popScope();
+
+                        p.fn_or_arrow_data_visit = old_fn_or_arrow_data;
+                        p.fn_only_data_visit = old_fn_only_data;
+
+                        continue;
                     }
-                } else if (property.flags.contains(.is_method)) {
-                    if (comptime is_typescript_enabled) {
-                        if (property.value.?.data == .e_function and property.key.?.data == .e_string and
-                            property.key.?.data.e_string.eqlComptime("constructor"))
-                        {
-                            constructor_function_ = property.value.?.data.e_function;
-                            constructor_function = constructor_function_;
-                        }
-                    }
-                }
+                    property.ts_decorators = p.visitTSDecorators(property.ts_decorators);
+                    const is_private = if (property.key != null) @as(Expr.Tag, property.key.?.data) == .e_private_identifier else false;
 
-                if (property.value) |val| {
-                    if (name_to_keep) |name| {
-                        const was_anon = p.isAnonymousNamedExpr(val);
-                        property.value = p.maybeKeepExprSymbolName(p.visitExpr(val), name, was_anon);
-                    } else {
-                        property.value = p.visitExpr(val);
+                    // Special-case EPrivateIdentifier to allow it here
+
+                    if (is_private) {
+                        p.recordDeclaredSymbol(property.key.?.data.e_private_identifier.ref) catch unreachable;
+                    } else if (property.key) |key| {
+                        class.properties[i].key = p.visitExpr(key);
                     }
 
-                    if (comptime is_typescript_enabled) {
-                        if (constructor_function_ != null and property.value != null and property.value.?.data == .e_function) {
-                            constructor_function = property.value.?.data.e_function;
-                        }
-                    }
-                }
+                    // Make it an error to use "arguments" in a class body
+                    p.current_scope.forbid_arguments = true;
+                    defer p.current_scope.forbid_arguments = false;
 
-                if (property.initializer) |val| {
-                    // if (property.flags.is_static and )
-                    if (name_to_keep) |name| {
-                        const was_anon = p.isAnonymousNamedExpr(val);
-                        property.initializer = p.maybeKeepExprSymbolName(p.visitExpr(val), name, was_anon);
-                    } else {
-                        property.initializer = p.visitExpr(val);
-                    }
-                }
-            }
+                    // The value of "this" is shadowed inside property values
+                    const old_is_this_captured = p.fn_only_data_visit.is_this_nested;
+                    const old_this = p.fn_only_data_visit.this_class_static_ref;
+                    p.fn_only_data_visit.is_this_nested = true;
+                    p.fn_only_data_visit.is_new_target_allowed = true;
+                    p.fn_only_data_visit.this_class_static_ref = null;
+                    defer p.fn_only_data_visit.is_this_nested = old_is_this_captured;
+                    defer p.fn_only_data_visit.this_class_static_ref = old_this;
 
-            // note: our version assumes useDefineForClassFields is true
-            if (comptime is_typescript_enabled) {
-                if (constructor_function) |constructor| {
-                    var to_add: usize = 0;
-                    for (constructor.func.args) |arg| {
-                        to_add += @boolToInt(arg.is_typescript_ctor_field and arg.binding.data == .b_identifier);
-                    }
+                    // We need to explicitly assign the name to the property initializer if it
+                    // will be transformed such that it is no longer an inline initializer.
 
-                    if (to_add > 0) {
-                        // to match typescript behavior, we also must prepend to the class body
-                        var stmts = std.ArrayList(Stmt).fromOwnedSlice(p.allocator, constructor.func.body.stmts);
-                        stmts.ensureUnusedCapacity(to_add) catch unreachable;
-                        var class_body = std.ArrayList(G.Property).fromOwnedSlice(p.allocator, class.properties);
-                        class_body.ensureUnusedCapacity(to_add) catch unreachable;
-                        var j: usize = 0;
+                    var constructor_function_: ?*E.Function = null;
 
-                        for (constructor.func.args) |arg| {
-                            if (arg.is_typescript_ctor_field) {
-                                switch (arg.binding.data) {
-                                    .b_identifier => |id| {
-                                        const name = p.symbols.items[id.ref.innerIndex()].original_name;
-                                        const ident = p.e(E.Identifier{ .ref = id.ref }, arg.binding.loc);
-                                        stmts.appendAssumeCapacity(
-                                            Expr.assignStmt(
-                                                p.e(E.Dot{
-                                                    .target = p.e(E.This{}, arg.binding.loc),
-                                                    .name = name,
-                                                    .name_loc = arg.binding.loc,
-                                                }, arg.binding.loc),
-                                                ident,
-                                                p.allocator,
-                                            ),
-                                        );
-                                        // O(N)
-                                        class_body.items.len += 1;
-                                        std.mem.copyBackwards(G.Property, class_body.items[j + 1 .. class_body.items.len], class_body.items[j .. class_body.items.len - 1]);
-                                        class_body.items[j] = G.Property{ .key = ident };
-                                        j += 1;
-                                    },
-                                    else => {},
-                                }
+                    var name_to_keep: ?string = null;
+                    if (is_private) {} else if (!property.flags.contains(.is_method) and !property.flags.contains(.is_computed)) {
+                        if (property.key) |key| {
+                            if (@as(Expr.Tag, key.data) == .e_string) {
+                                name_to_keep = key.data.e_string.string(p.allocator) catch unreachable;
                             }
                         }
+                    } else if (property.flags.contains(.is_method)) {
+                        if (comptime is_typescript_enabled) {
+                            if (property.value.?.data == .e_function and property.key.?.data == .e_string and
+                                property.key.?.data.e_string.eqlComptime("constructor"))
+                            {
+                                constructor_function_ = property.value.?.data.e_function;
+                                constructor_function = constructor_function_;
+                            }
+                        }
+                    }
 
-                        class.properties = class_body.toOwnedSlice();
-                        constructor.func.body.stmts = stmts.toOwnedSlice();
+                    if (property.value) |val| {
+                        if (name_to_keep) |name| {
+                            const was_anon = p.isAnonymousNamedExpr(val);
+                            property.value = p.maybeKeepExprSymbolName(p.visitExpr(val), name, was_anon);
+                        } else {
+                            property.value = p.visitExpr(val);
+                        }
+
+                        if (comptime is_typescript_enabled) {
+                            if (constructor_function_ != null and property.value != null and property.value.?.data == .e_function) {
+                                constructor_function = property.value.?.data.e_function;
+                            }
+                        }
+                    }
+
+                    if (property.initializer) |val| {
+                        // if (property.flags.is_static and )
+                        if (name_to_keep) |name| {
+                            const was_anon = p.isAnonymousNamedExpr(val);
+                            property.initializer = p.maybeKeepExprSymbolName(p.visitExpr(val), name, was_anon);
+                        } else {
+                            property.initializer = p.visitExpr(val);
+                        }
+                    }
+                }
+
+                // note: our version assumes useDefineForClassFields is true
+                if (comptime is_typescript_enabled) {
+                    if (constructor_function) |constructor| {
+                        var to_add: usize = 0;
+                        for (constructor.func.args) |arg| {
+                            to_add += @boolToInt(arg.is_typescript_ctor_field and arg.binding.data == .b_identifier);
+                        }
+
+                        if (to_add > 0) {
+                            // to match typescript behavior, we also must prepend to the class body
+                            var stmts = std.ArrayList(Stmt).fromOwnedSlice(p.allocator, constructor.func.body.stmts);
+                            stmts.ensureUnusedCapacity(to_add) catch unreachable;
+                            var class_body = std.ArrayList(G.Property).fromOwnedSlice(p.allocator, class.properties);
+                            class_body.ensureUnusedCapacity(to_add) catch unreachable;
+                            var j: usize = 0;
+
+                            for (constructor.func.args) |arg| {
+                                if (arg.is_typescript_ctor_field) {
+                                    switch (arg.binding.data) {
+                                        .b_identifier => |id| {
+                                            const name = p.symbols.items[id.ref.innerIndex()].original_name;
+                                            const ident = p.e(E.Identifier{ .ref = id.ref }, arg.binding.loc);
+                                            stmts.appendAssumeCapacity(
+                                                Expr.assignStmt(
+                                                    p.e(E.Dot{
+                                                        .target = p.e(E.This{}, arg.binding.loc),
+                                                        .name = name,
+                                                        .name_loc = arg.binding.loc,
+                                                    }, arg.binding.loc),
+                                                    ident,
+                                                    p.allocator,
+                                                ),
+                                            );
+                                            // O(N)
+                                            class_body.items.len += 1;
+                                            std.mem.copyBackwards(G.Property, class_body.items[j + 1 .. class_body.items.len], class_body.items[j .. class_body.items.len - 1]);
+                                            class_body.items[j] = G.Property{ .key = ident };
+                                            j += 1;
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            }
+
+                            class.properties = class_body.toOwnedSlice();
+                            constructor.func.body.stmts = stmts.toOwnedSlice();
+                        }
                     }
                 }
             }
@@ -17039,6 +17661,9 @@ fn NewParser_(
                     p.recordDeclaredSymbol(class_name_ref) catch unreachable;
                 }
             }
+
+            // class name scope
+            p.popScope();
 
             return shadow_ref;
         }
@@ -17094,85 +17719,240 @@ fn NewParser_(
                 @compileError("only_scan_imports_and_do_not_visit must not run this.");
             }
 
-            // Save the current control-flow liveness. This represents if we are
-            // currently inside an "if (false) { ... }" block.
-            var old_is_control_flow_dead = p.is_control_flow_dead;
-            defer p.is_control_flow_dead = old_is_control_flow_dead;
+            var initial_scope: *Scope = if (comptime Environment.allow_assert) p.current_scope else undefined;
 
-            // visit all statements first
-            var visited = try ListManaged(Stmt).initCapacity(p.allocator, stmts.items.len);
-            var before = ListManaged(Stmt).init(p.allocator);
-            var after = ListManaged(Stmt).init(p.allocator);
+            {
 
-            if (p.current_scope == p.module_scope) {
-                p.macro.prepend_stmts = &before;
-            }
+                // Save the current control-flow liveness. This represents if we are
+                // currently inside an "if (false) { ... }" block.
+                var old_is_control_flow_dead = p.is_control_flow_dead;
+                defer p.is_control_flow_dead = old_is_control_flow_dead;
 
-            defer before.deinit();
-            defer visited.deinit();
-            defer after.deinit();
+                var before = ListManaged(Stmt).init(p.allocator);
+                var after = ListManaged(Stmt).init(p.allocator);
 
-            for (stmts.items) |*stmt| {
-                const list = list_getter: {
-                    switch (stmt.data) {
-                        .s_export_equals => {
-                            // TypeScript "export = value;" becomes "module.exports = value;". This
-                            // must happen at the end after everything is parsed because TypeScript
-                            // moves this statement to the end when it generates code.
-                            break :list_getter &after;
-                        },
-                        .s_function => |data| {
-                            // Manually hoist block-level function declarations to preserve semantics.
-                            // This is only done for function declarations that are not generators
-                            // or async functions, since this is a backwards-compatibility hack from
-                            // Annex B of the JavaScript standard.
-                            if (!p.current_scope.kindStopsHoisting() and p.symbols.items[data.func.name.?.ref.?.innerIndex()].kind == .hoisted_function) {
-                                break :list_getter &before;
-                            }
-                        },
-                        else => {},
-                    }
-                    break :list_getter &visited;
-                };
-                try p.visitAndAppendStmt(list, stmt);
-            }
-
-            var visited_count = visited.items.len;
-            if (p.is_control_flow_dead) {
-                var end: usize = 0;
-                for (visited.items) |item| {
-                    if (!SideEffects.shouldKeepStmtInDeadControlFlow(item, p.allocator)) {
-                        continue;
-                    }
-
-                    visited.items[end] = item;
-                    end += 1;
+                if (p.current_scope == p.module_scope) {
+                    p.macro.prepend_stmts = &before;
                 }
-                visited_count = end;
+
+                // visit all statements first
+                var visited = try ListManaged(Stmt).initCapacity(p.allocator, stmts.items.len);
+
+                defer before.deinit();
+                defer visited.deinit();
+                defer after.deinit();
+
+                for (stmts.items) |*stmt| {
+                    const list = list_getter: {
+                        switch (stmt.data) {
+                            .s_export_equals => {
+                                // TypeScript "export = value;" becomes "module.exports = value;". This
+                                // must happen at the end after everything is parsed because TypeScript
+                                // moves this statement to the end when it generates code.
+                                break :list_getter &after;
+                            },
+                            .s_function => |data| {
+                                // Manually hoist block-level function declarations to preserve semantics.
+                                // This is only done for function declarations that are not generators
+                                // or async functions, since this is a backwards-compatibility hack from
+                                // Annex B of the JavaScript standard.
+                                if (!p.current_scope.kindStopsHoisting() and p.symbols.items[data.func.name.?.ref.?.innerIndex()].kind == .hoisted_function) {
+                                    break :list_getter &before;
+                                }
+                            },
+                            else => {},
+                        }
+                        break :list_getter &visited;
+                    };
+                    try p.visitAndAppendStmt(list, stmt);
+                }
+
+                var visited_count = visited.items.len;
+                if (p.is_control_flow_dead) {
+                    var end: usize = 0;
+                    for (visited.items) |item| {
+                        if (!SideEffects.shouldKeepStmtInDeadControlFlow(item, p.allocator)) {
+                            continue;
+                        }
+
+                        visited.items[end] = item;
+                        end += 1;
+                    }
+                    visited_count = end;
+                }
+
+                const total_size = visited_count + before.items.len + after.items.len;
+
+                if (total_size != stmts.items.len) {
+                    try stmts.resize(total_size);
+                }
+
+                var i: usize = 0;
+
+                for (before.items) |item| {
+                    stmts.items[i] = item;
+                    i += 1;
+                }
+
+                const visited_slice = visited.items[0..visited_count];
+                for (visited_slice) |item| {
+                    stmts.items[i] = item;
+                    i += 1;
+                }
+
+                for (after.items) |item| {
+                    stmts.items[i] = item;
+                    i += 1;
+                }
             }
 
-            const total_size = visited_count + before.items.len + after.items.len;
+            if (comptime Environment.allow_assert)
+                // if this fails it means that scope pushing/popping is not balanced
+                assert(p.current_scope == initial_scope);
 
-            if (total_size != stmts.items.len) {
-                try stmts.resize(total_size);
+            if (!p.options.features.inlining) {
+                return;
             }
 
-            var i: usize = 0;
+            if (p.current_scope.parent != null and !p.current_scope.contains_direct_eval) {
 
-            for (before.items) |item| {
-                stmts.items[i] = item;
-                i += 1;
+                // Remove inlined constants now that we know whether any of these statements
+                // contained a direct eval() or not. This can't be done earlier when we
+                // encounter the constant because we haven't encountered the eval() yet.
+                // Inlined constants are not removed if they are in a top-level scope or
+                // if they are exported (which could be in a nested TypeScript namespace).
+                if (p.const_values.count() > 0) {
+                    var items: []Stmt = stmts.items;
+                    for (items) |*stmt| {
+                        switch (stmt.data) {
+                            .s_empty, .s_comment, .s_directive, .s_debugger, .s_type_script => continue,
+                            .s_local => |local| {
+                                if (!local.is_export and local.kind == .k_const) {
+                                    var decls: []Decl = local.decls;
+                                    var end: usize = 0;
+                                    for (decls) |decl| {
+                                        if (decl.binding.data == .b_identifier) {
+                                            if (p.const_values.contains(decl.binding.data.b_identifier.ref)) {
+                                                continue;
+                                            }
+                                        }
+                                        decls[end] = decl;
+                                        end += 1;
+                                    }
+                                    local.decls.len = end;
+                                    if (end == 0) {
+                                        stmt.* = stmt.*.toEmpty();
+                                    }
+                                    continue;
+                                }
+                            },
+                            else => {},
+                        }
+
+                        break;
+                    }
+                }
             }
 
-            const visited_slice = visited.items[0..visited_count];
-            for (visited_slice) |item| {
-                stmts.items[i] = item;
-                i += 1;
-            }
+            // Inline single-use variable declarations where possible:
+            //
+            //   // Before
+            //   let x = fn();
+            //   return x.y();
+            //
+            //   // After
+            //   return fn().y();
+            //
+            // The declaration must not be exported. We can't just check for the
+            // "export" keyword because something might do "export {id};" later on.
+            // Instead we just ignore all top-level declarations for now. That means
+            // this optimization currently only applies in nested scopes.
+            //
+            // Ignore declarations if the scope is shadowed by a direct "eval" call.
+            // The eval'd code may indirectly reference this symbol and the actual
+            // use count may be greater than 1.
+            if (p.current_scope != p.module_scope and !p.current_scope.contains_direct_eval) {
+                var output = ListManaged(Stmt).initCapacity(p.allocator, stmts.items.len) catch unreachable;
 
-            for (after.items) |item| {
-                stmts.items[i] = item;
-                i += 1;
+                for (stmts.items) |stmt| {
+
+                    // Keep inlining variables until a failure or until there are none left.
+                    // That handles cases like this:
+                    //
+                    //   // Before
+                    //   let x = fn();
+                    //   let y = x.prop;
+                    //   return y;
+                    //
+                    //   // After
+                    //   return fn().prop;
+                    //
+                    inner: while (output.items.len > 0) {
+                        // Ignore "var" declarations since those have function-level scope and
+                        // we may not have visited all of their uses yet by this point. We
+                        // should have visited all the uses of "let" and "const" declarations
+                        // by now since they are scoped to this block which we just finished
+                        // visiting.
+                        var prev_statement = &output.items[output.items.len - 1];
+                        switch (prev_statement.data) {
+                            .s_local => {
+                                var local = prev_statement.data.s_local;
+                                if (local.decls.len == 0 or local.kind == .k_var or local.is_export) {
+                                    break;
+                                }
+
+                                var last: *Decl = &local.decls[local.decls.len - 1];
+                                // The variable must be initialized, since we will be substituting
+                                // the value into the usage.
+                                if (last.value == null)
+                                    break;
+
+                                // The binding must be an identifier that is only used once.
+                                // Ignore destructuring bindings since that's not the simple case.
+                                // Destructuring bindings could potentially execute side-effecting
+                                // code which would invalidate reordering.
+
+                                switch (last.binding.data) {
+                                    .b_identifier => |ident| {
+                                        const id = ident.ref;
+
+                                        const symbol: *const Symbol = &p.symbols.items[id.innerIndex()];
+
+                                        // Try to substitute the identifier with the initializer. This will
+                                        // fail if something with side effects is in between the declaration
+                                        // and the usage.
+                                        if (symbol.use_count_estimate == 1) {
+                                            if (p.substituteSingleUseSymbolInStmt(stmt, id, last.value.?)) {
+                                                switch (local.decls.len) {
+                                                    1 => {
+                                                        local.decls.len = 0;
+                                                        output.items.len -= 1;
+                                                        continue :inner;
+                                                    },
+                                                    else => {
+                                                        local.decls.len -= 1;
+                                                        continue :inner;
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            },
+                            else => {},
+                        }
+                        break;
+                    }
+
+                    if (stmt.data != .s_empty) {
+                        output.appendAssumeCapacity(
+                            stmt,
+                        );
+                    }
+                }
+                stmts.deinit();
+                stmts.* = output;
             }
         }
 

@@ -1,7 +1,7 @@
 import {
 __HMRClient as Bun
 } from "http://localhost:8080/bun:wrap";
-Bun.activate(false);
+Bun.activate(true);
 import {
 __HMRModule as HMR
 } from "http://localhost:8080/bun:wrap";
