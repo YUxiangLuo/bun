@@ -35,7 +35,51 @@ fn ObjectPtrType(comptime Type: type) type {
     return *Type;
 }
 
+const Internal = struct {
+    pub fn toJSWithType(globalThis: *JSC.JSGlobalObject, comptime Type: type, value: Type, exception: JSC.C.ExceptionRef) JSValue {
+        // TODO: refactor withType to use this instead of the other way around
+        return JSC.JSValue.c(To.JS.withType(Type, value, globalThis, exception));
+    }
+
+    pub fn toJS(globalThis: *JSC.JSGlobalObject, value: anytype, exception: JSC.C.ExceptionRef) JSValue {
+        return toJSWithType(globalThis, @TypeOf(value), value, exception);
+    }
+};
+
+pub usingnamespace Internal;
+
 pub const To = struct {
+    pub const Cpp = struct {
+        pub fn PropertyGetter(
+            comptime Type: type,
+        ) type {
+            return comptime fn (
+                this: ObjectPtrType(Type),
+                globalThis: *JSC.JSGlobalObject,
+            ) callconv(.C) JSC.JSValue;
+        }
+
+        const toJS = Internal.toJSWithType;
+
+        pub fn GetterFn(comptime Type: type, comptime decl: std.meta.DeclEnum(Type)) PropertyGetter(Type) {
+            return struct {
+                pub fn getter(
+                    this: ObjectPtrType(Type),
+                    globalThis: *JSC.JSGlobalObject,
+                ) callconv(.C) JSC.JSValue {
+                    var exception_ref = [_]JSC.C.JSValueRef{null};
+                    var exception: JSC.C.ExceptionRef = &exception_ref;
+                    const result = toJS(globalThis, @call(.auto, @field(Type, @tagName(decl)), .{this}), exception);
+                    if (exception.* != null) {
+                        globalThis.throwValue(JSC.JSValue.c(exception.*));
+                        return .zero;
+                    }
+
+                    return result;
+                }
+            }.getter;
+        }
+    };
     pub const JS = struct {
         pub inline fn str(_: anytype, val: anytype) js.JSStringRef {
             return js.JSStringCreateWithUTF8CString(val[0.. :0]);
@@ -151,6 +195,20 @@ pub const To = struct {
 
                     break :brk val.asObjectRef();
                 },
+                []const JSC.ZigString => {
+                    var array = JSC.JSValue.createStringArray(context.ptr(), value.ptr, value.len, clone).asObjectRef();
+                    const values: []const JSC.ZigString = value;
+                    defer bun.default_allocator.free(values);
+                    if (clone) {
+                        for (values) |out| {
+                            if (out.isGloballyAllocated()) {
+                                out.deinitGlobal();
+                            }
+                        }
+                    }
+
+                    return array;
+                },
                 []const PathString, []const []const u8, []const []u8, [][]const u8, [][:0]const u8, [][:0]u8 => {
                     if (value.len == 0)
                         return JSC.C.JSObjectMakeArray(context, 0, null, exception);
@@ -190,9 +248,9 @@ pub const To = struct {
                 JSC.C.JSValueRef => value,
 
                 else => {
-                    const Info: std.builtin.TypeInfo = comptime @typeInfo(Type);
+                    const Info: std.builtin.Type = comptime @typeInfo(Type);
                     if (comptime Info == .Enum) {
-                        const Enum: std.builtin.TypeInfo.Enum = Info.Enum;
+                        const Enum: std.builtin.Type.Enum = Info.Enum;
                         if (comptime !std.meta.trait.isNumber(Enum.tag_type)) {
                             zig_str = JSC.ZigString.init(@tagName(value));
                             return zig_str.toValue(context.ptr()).asObjectRef();
@@ -207,7 +265,7 @@ pub const To = struct {
                         if (value.len <= prefill) {
                             var array: [prefill]JSC.C.JSValueRef = undefined;
                             var i: u8 = 0;
-                            const len = @minimum(@intCast(u8, value.len), prefill);
+                            const len = @min(@intCast(u8, value.len), prefill);
                             while (i < len and exception.* == null) : (i += 1) {
                                 array[i] = if (comptime Child == JSC.C.JSValueRef)
                                     value[i]
@@ -270,7 +328,7 @@ pub const To = struct {
                     if (comptime Info == .Struct) {
                         if (comptime @hasDecl(Type, "Class") and @hasDecl(Type.Class, "isJavaScriptCoreClass")) {
                             if (comptime !@hasDecl(Type, "finalize")) {
-                                @compileError(comptime std.fmt.comptimePrint("JSC class {s} must implement finalize to prevent memory leaks", .{Type.Class.name}));
+                                @compileError(std.fmt.comptimePrint("JSC class {s} must implement finalize to prevent memory leaks", .{Type.Class.name}));
                             }
 
                             if (comptime !@hasDecl(Type, "toJS")) {
@@ -279,6 +337,12 @@ pub const To = struct {
                                 return Type.Class.make(context, val);
                             }
                         }
+                    }
+
+                    if (comptime @hasDecl(Type, "toJS") and @typeInfo(@TypeOf(@field(Type, "toJS"))).Fn.params.len == 2) {
+                        var val = bun.default_allocator.create(Type) catch unreachable;
+                        val.* = value;
+                        return val.toJS(context).asObjectRef();
                     }
 
                     const res = value.toJS(context, exception);
@@ -313,10 +377,19 @@ pub const To = struct {
                     _: js.JSStringRef,
                     exception: js.ExceptionRef,
                 ) js.JSValueRef {
-                    return withType(std.meta.fieldInfo(Type, field).field_type, @field(this, @tagName(field)), ctx, exception);
+                    return withType(std.meta.fieldInfo(Type, field).type, @field(this, @tagName(field)), ctx, exception);
                 }
             }.rfn;
         }
+
+        pub const JSC_C_Function = fn (
+            js.JSContextRef,
+            js.JSObjectRef,
+            js.JSObjectRef,
+            usize,
+            [*c]const js.JSValueRef,
+            js.ExceptionRef,
+        ) callconv(.C) js.JSValueRef;
 
         pub fn Callback(
             comptime ZigContextType: type,
@@ -838,7 +911,7 @@ pub fn NewConstructor(
 ) type {
     return struct {
         pub usingnamespace NewClassWithInstanceType(void, InstanceType.Class.class_options, staticFunctions, properties, InstanceType);
-        const name_string = &ZigString.init(InstanceType.Class.class_options.name);
+        const name_string = ZigString.static(InstanceType.Class.class_options.name);
         pub fn constructor(ctx: js.JSContextRef) callconv(.C) js.JSObjectRef {
             return JSValue.makeWithNameAndPrototype(
                 ctx.ptr(),
@@ -907,7 +980,7 @@ pub fn NewClassWithInstanceType(
                 arguments: [*c]const js.JSValueRef,
                 exception: js.ExceptionRef,
             ) callconv(.C) js.JSValueRef {
-                return &complete_definition.callAsConstructor.?(ctx, function, argumentCount, arguments, exception);
+                return getClassDefinition().callAsConstructor.?(ctx, function, argumentCount, arguments, exception);
             }
         };
 
@@ -929,14 +1002,60 @@ pub fn NewClassWithInstanceType(
         }
 
         pub const Constructor = ConstructorWrapper.rfn;
-        const class_definition_ptr = &complete_definition;
+
+        var class_definition: js.JSClassDefinition = undefined;
+        var class_definition_set: bool = false;
+        const static_functions__: [function_name_literals.len + 1]js.JSStaticFunction = if (function_name_literals.len > 0) generateDef([function_name_literals.len + 1]js.JSStaticFunction) else undefined;
+        const static_values_ptr = &static_properties;
+
+        fn generateClassDefinition() void {
+            class_definition = comptime brk: {
+                var def = generateDef(JSC.C.JSClassDefinition);
+                if (function_name_literals.len > 0)
+                    def.staticFunctions = &static_functions__;
+                if (options.no_inheritance) {
+                    def.attributes = JSC.C.JSClassAttributes.kJSClassAttributeNoAutomaticPrototype;
+                }
+                if (property_names.len > 0) {
+                    def.staticValues = static_values_ptr;
+                }
+
+                def.className = options.name.ptr;
+                // def.getProperty = getPropertyCallback;
+
+                if (def.callAsConstructor == null) {
+                    def.callAsConstructor = &throwInvalidConstructorError;
+                }
+
+                if (def.callAsFunction == null) {
+                    def.callAsFunction = &throwInvalidFunctionError;
+                }
+
+                if (def.getPropertyNames == null) {
+                    def.getPropertyNames = &getPropertyNames;
+                }
+
+                if (!singleton and def.hasInstance == null)
+                    def.hasInstance = &customHasInstance;
+                break :brk def;
+            };
+        }
+
+        fn getClassDefinition() *const JSC.C.JSClassDefinition {
+            if (!class_definition_set) {
+                class_definition_set = true;
+                generateClassDefinition();
+            }
+
+            return &class_definition;
+        }
 
         pub fn get() callconv(.C) [*c]js.JSClassRef {
             var lazy = lazy_ref;
 
             if (!lazy.loaded) {
                 lazy = .{
-                    .ref = js.JSClassCreate(class_definition_ptr),
+                    .ref = js.JSClassCreate(getClassDefinition()),
                     .loaded = true,
                 };
                 lazy_ref = lazy;
@@ -1064,7 +1183,7 @@ pub fn NewClassWithInstanceType(
                                 js.ExceptionRef,
                             ) js.JSValueRef;
 
-                            if (Func.Fn.args.len == @typeInfo(WithPropFn).Fn.args.len) {
+                            if (Func.Fn.params.len == @typeInfo(WithPropFn).Fn.params.len) {
                                 return func(
                                     this,
                                     ctx,
@@ -1120,43 +1239,45 @@ pub fn NewClassWithInstanceType(
             };
         }
 
-        pub inline fn getDefinition() js.JSClassDefinition {
-            var definition = complete_definition;
-            definition.className = options.name;
-            return definition;
-        }
-
         pub fn getPropertyNames(
             _: js.JSContextRef,
             _: js.JSObjectRef,
             props: js.JSPropertyNameAccumulatorRef,
         ) callconv(.C) void {
             if (comptime property_name_refs.len > 0) {
-                comptime var i: usize = 0;
                 if (!property_name_refs_set) {
+                    comptime var i: usize = 0;
                     property_name_refs_set = true;
-                    inline while (i < property_name_refs.len) : (i += 1) {
+                    inline while (i < comptime property_name_refs.len) : (i += 1) {
                         property_name_refs[i] = js.JSStringCreateStatic(property_names[i].ptr, property_names[i].len);
                     }
                     comptime i = 0;
-                }
-                inline while (i < property_name_refs.len) : (i += 1) {
-                    js.JSPropertyNameAccumulatorAddName(props, property_name_refs[i]);
+                } else {
+                    comptime var i: usize = 0;
+                    inline while (i < property_name_refs.len) : (i += 1) {
+                        js.JSPropertyNameAccumulatorAddName(props, property_name_refs[i]);
+                    }
                 }
             }
 
+            const ref_len = comptime function_name_refs.len;
             if (comptime function_name_refs.len > 0) {
-                comptime var j: usize = 0;
                 if (!function_name_refs_set) {
+                    comptime var j: usize = 0;
                     function_name_refs_set = true;
-                    inline while (j < function_name_refs.len) : (j += 1) {
+                    inline while (j < ref_len) : (j += 1) {
                         function_name_refs[j] = js.JSStringCreateStatic(function_names[j].ptr, function_names[j].len);
                     }
                     comptime j = 0;
-                }
 
-                inline while (j < function_name_refs.len) : (j += 1) {
-                    js.JSPropertyNameAccumulatorAddName(props, function_name_refs[j]);
+                    inline while (j < ref_len) : (j += 1) {
+                        js.JSPropertyNameAccumulatorAddName(props, function_name_refs[j]);
+                    }
+                } else {
+                    comptime var j: usize = 0;
+                    inline while (j < ref_len) : (j += 1) {
+                        js.JSPropertyNameAccumulatorAddName(props, function_name_refs[j]);
+                    }
                 }
             }
         }
@@ -1173,10 +1294,10 @@ pub fn NewClassWithInstanceType(
                     .attributes = js.JSPropertyAttributes.kJSPropertyAttributeNone,
                 },
             );
-            for (property_name_literals) |_, i| {
+            for (property_name_literals) |lit, i| {
                 props[i] = brk2: {
                     var static_prop = JSC.C.JSStaticValue{
-                        .name = property_names[i][0.. :0].ptr,
+                        .name = lit.ptr[0..lit.len :0],
                         .getProperty = null,
                         .setProperty = null,
                         .attributes = @intToEnum(js.JSPropertyAttributes, 0),
@@ -1196,7 +1317,7 @@ pub fn NewClassWithInstanceType(
 
         // this madness is a workaround for stage1 compiler bugs
         fn generateDef(comptime ReturnType: type) ReturnType {
-            var count = 0;
+            var count: usize = 0;
             var def: js.JSClassDefinition = js.JSClassDefinition{
                 .version = 0,
                 .attributes = js.JSClassAttributes.kJSClassAttributeNone,
@@ -1216,80 +1337,80 @@ pub fn NewClassWithInstanceType(
                 .hasInstance = null,
                 .convertToType = null,
             };
-
             var __static_functions: [function_name_literals.len + 1]js.JSStaticFunction = undefined;
             for (__static_functions) |_, i| {
                 __static_functions[i] = js.JSStaticFunction{
-                    .name = @intToPtr([*c]const u8, 0),
+                    .name = "",
                     .callAsFunction = null,
                     .attributes = js.JSPropertyAttributes.kJSPropertyAttributeNone,
                 };
             }
 
-            for (function_name_literals) |function_name_literal, i| {
-                const is_read_only = options.read_only;
+            @setEvalBranchQuota(50_000);
+            const is_read_only = options.read_only;
 
-                _ = i;
-                switch (@typeInfo(@TypeOf(@field(staticFunctions, function_name_literal)))) {
+            inline for (comptime function_name_literals) |function_name_literal| {
+                const CtxField = comptime @field(staticFunctions, function_name_literal);
+
+                switch (comptime @typeInfo(@TypeOf(CtxField))) {
                     .Struct => {
-                        const CtxField = @field(staticFunctions, function_name_literals[i]);
-
-                        if (strings.eqlComptime(function_name_literal, "constructor")) {
-                            def.callAsConstructor = To.JS.Constructor(staticFunctions.constructor.rfn).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "finalize")) {
-                            def.finalize = To.JS.Finalize(ZigType, staticFunctions.finalize.rfn).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "call")) {
-                            def.callAsFunction = To.JS.Callback(ZigType, staticFunctions.call.rfn).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "callAsFunction")) {
+                        if (comptime strings.eqlComptime(function_name_literal, "constructor")) {
+                            def.callAsConstructor = &To.JS.Constructor(staticFunctions.constructor.rfn).rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "finalize")) {
+                            def.finalize = &To.JS.Finalize(ZigType, staticFunctions.finalize.rfn).rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "call")) {
+                            def.callAsFunction = &To.JS.Callback(ZigType, staticFunctions.call.rfn).rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "callAsFunction")) {
                             const ctxfn = @field(staticFunctions, function_name_literal).rfn;
-                            const Func: std.builtin.TypeInfo.Fn = @typeInfo(@TypeOf(ctxfn)).Fn;
+                            const Func: std.builtin.Type.Fn = @typeInfo(@TypeOf(if (@typeInfo(@TypeOf(ctxfn)) == .Pointer) ctxfn.* else ctxfn)).Fn;
 
-                            const PointerType = std.meta.Child(Func.args[0].arg_type.?);
+                            const PointerType = std.meta.Child(Func.params[0].type.?);
 
-                            def.callAsFunction = if (Func.calling_convention == .C) ctxfn else To.JS.Callback(
+                            def.callAsFunction = &(if (Func.calling_convention == .C) ctxfn else To.JS.Callback(
                                 PointerType,
                                 ctxfn,
-                            ).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "hasProperty")) {
+                            ).rfn);
+                        } else if (comptime strings.eqlComptime(function_name_literal, "hasProperty")) {
                             def.hasProperty = @field(staticFunctions, "hasProperty").rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "getProperty")) {
+                        } else if (comptime strings.eqlComptime(function_name_literal, "getProperty")) {
                             def.getProperty = @field(staticFunctions, "getProperty").rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "setProperty")) {
+                        } else if (comptime strings.eqlComptime(function_name_literal, "setProperty")) {
                             def.setProperty = @field(staticFunctions, "setProperty").rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "deleteProperty")) {
-                            def.deleteProperty = @field(staticFunctions, "deleteProperty").rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "getPropertyNames")) {
+                        } else if (comptime strings.eqlComptime(function_name_literal, "deleteProperty")) {
+                            def.deleteProperty = &@field(staticFunctions, "deleteProperty").rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "getPropertyNames")) {
                             def.getPropertyNames = @field(staticFunctions, "getPropertyNames").rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "convertToType")) {
+                        } else if (comptime strings.eqlComptime(function_name_literal, "convertToType")) {
                             def.convertToType = @field(staticFunctions, "convertToType").rfn;
-                        } else if (!@hasField(@TypeOf(CtxField), "is_dom_call")) {
+                        } else if (comptime !@hasField(@TypeOf(CtxField), "is_dom_call")) {
                             if (!@hasField(@TypeOf(CtxField), "rfn")) {
                                 @compileError("Expected " ++ options.name ++ "." ++ function_name_literal ++ " to have .rfn");
                             }
                             const ctxfn = CtxField.rfn;
-                            const Func: std.builtin.TypeInfo.Fn = @typeInfo(@TypeOf(ctxfn)).Fn;
+                            const Func: std.builtin.Type.Fn = @typeInfo(@TypeOf(if (@typeInfo(@TypeOf(ctxfn)) == .Pointer) ctxfn.* else ctxfn)).Fn;
 
                             var attributes: c_uint = @enumToInt(js.JSPropertyAttributes.kJSPropertyAttributeNone);
 
-                            if (is_read_only or hasReadOnly(@TypeOf(CtxField))) {
+                            if (comptime is_read_only or hasReadOnly(@TypeOf(CtxField))) {
                                 attributes |= @enumToInt(js.JSPropertyAttributes.kJSPropertyAttributeReadOnly);
                             }
 
-                            if (hasEnumerable(@TypeOf(CtxField)) and !CtxField.enumerable) {
+                            if (comptime hasEnumerable(@TypeOf(CtxField)) and !CtxField.enumerable) {
                                 attributes |= @enumToInt(js.JSPropertyAttributes.kJSPropertyAttributeDontEnum);
                             }
 
-                            var PointerType = void;
-
-                            if (Func.args[0].arg_type.? != void) {
-                                PointerType = std.meta.Child(Func.args[0].arg_type.?);
-                            }
+                            const PointerType = comptime brk: {
+                                if (Func.params[0].type.? != void) {
+                                    break :brk std.meta.Child(Func.params[0].type.?);
+                                }
+                                break :brk void;
+                            };
 
                             __static_functions[count] = js.JSStaticFunction{
-                                .name = @ptrCast([*c]const u8, function_names[i].ptr),
-                                .callAsFunction = if (Func.calling_convention == .C) ctxfn else To.JS.Callback(
+                                .name = bun.sliceTo(function_name_literal ++ [_]u8{0}, 0).ptr,
+                                .callAsFunction = if (Func.calling_convention == .C) &CtxField.rfn else &To.JS.Callback(
                                     PointerType,
-                                    ctxfn,
+                                    if (@typeInfo(@TypeOf(ctxfn)) == .Pointer) ctxfn.* else ctxfn,
                                 ).rfn,
                                 .attributes = @intToEnum(js.JSPropertyAttributes, attributes),
                             };
@@ -1298,16 +1419,16 @@ pub fn NewClassWithInstanceType(
                         }
                     },
                     .Fn => {
-                        if (strings.eqlComptime(function_name_literal, "constructor")) {
-                            def.callAsConstructor = To.JS.Constructor(staticFunctions.constructor).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "finalize")) {
-                            def.finalize = To.JS.Finalize(ZigType, staticFunctions.finalize).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "call")) {
-                            def.callAsFunction = To.JS.Callback(ZigType, staticFunctions.call).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "getPropertyNames")) {
-                            def.getPropertyNames = To.JS.Callback(ZigType, staticFunctions.getPropertyNames).rfn;
-                        } else if (strings.eqlComptime(function_name_literal, "hasInstance")) {
-                            def.hasInstance = staticFunctions.hasInstance;
+                        if (comptime strings.eqlComptime(function_name_literal, "constructor")) {
+                            def.callAsConstructor = &To.JS.Constructor(staticFunctions.constructor).rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "finalize")) {
+                            def.finalize = &To.JS.Finalize(ZigType, staticFunctions.finalize).rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "call")) {
+                            def.callAsFunction = &To.JS.Callback(ZigType, staticFunctions.call).rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "getPropertyNames")) {
+                            def.getPropertyNames = &To.JS.Callback(ZigType, staticFunctions.getPropertyNames).rfn;
+                        } else if (comptime strings.eqlComptime(function_name_literal, "hasInstance")) {
+                            def.hasInstance = &staticFunctions.hasInstance;
                         } else {
                             const attributes: js.JSPropertyAttributes = brk: {
                                 var base = @enumToInt(js.JSPropertyAttributes.kJSPropertyAttributeNone);
@@ -1319,8 +1440,8 @@ pub fn NewClassWithInstanceType(
                             };
 
                             __static_functions[count] = js.JSStaticFunction{
-                                .name = @ptrCast([*c]const u8, function_names[i].ptr),
-                                .callAsFunction = To.JS.Callback(
+                                .name = (function_name_literal ++ [_]u8{0})[0..function_name_literal.len :0],
+                                .callAsFunction = &To.JS.Callback(
                                     ZigType,
                                     @field(staticFunctions, function_name_literal),
                                 ).rfn,
@@ -1334,48 +1455,12 @@ pub fn NewClassWithInstanceType(
                 }
             }
 
-            if (ReturnType == JSC.C.JSClassDefinition) {
+            if (comptime ReturnType == JSC.C.JSClassDefinition) {
                 return def;
             } else {
                 return __static_functions;
             }
         }
-
-        const base_def_ = generateDef(JSC.C.JSClassDefinition);
-        const static_functions__: [function_name_literals.len + 1]js.JSStaticFunction = generateDef([function_name_literals.len + 1]js.JSStaticFunction);
-        const static_functions_ptr = &static_functions__;
-        const static_values_ptr = &static_properties;
-        const class_name_str: stringZ = options.name;
-
-        const complete_definition = brk: {
-            var def = base_def_;
-            def.staticFunctions = static_functions_ptr;
-            if (options.no_inheritance) {
-                def.attributes = JSC.C.JSClassAttributes.kJSClassAttributeNoAutomaticPrototype;
-            }
-            if (property_names.len > 0) {
-                def.staticValues = static_values_ptr;
-            }
-
-            def.className = class_name_str;
-            // def.getProperty = getPropertyCallback;
-
-            if (def.callAsConstructor == null) {
-                def.callAsConstructor = throwInvalidConstructorError;
-            }
-
-            if (def.callAsFunction == null) {
-                def.callAsFunction = throwInvalidFunctionError;
-            }
-
-            if (def.getPropertyNames == null) {
-                def.getPropertyNames = getPropertyNames;
-            }
-
-            if (!singleton and def.hasInstance == null)
-                def.hasInstance = customHasInstance;
-            break :brk def;
-        };
     };
 }
 
@@ -1541,13 +1626,21 @@ pub fn JSError(
 ) void {
     @setCold(true);
 
+    exception.* = createError(ctx, fmt, args).asObjectRef();
+}
+
+pub fn createError(
+    globalThis: *JSC.JSGlobalObject,
+    comptime fmt: string,
+    args: anytype,
+) JSC.JSValue {
     if (comptime std.meta.fields(@TypeOf(args)).len == 0) {
         var zig_str = JSC.ZigString.init(fmt);
         if (comptime !strings.isAllASCIISimple(fmt)) {
             zig_str.markUTF16();
         }
 
-        exception.* = zig_str.toErrorInstance(ctx).asObjectRef();
+        return zig_str.toErrorInstance(globalThis);
     } else {
         var fallback = std.heap.stackFallback(256, default_allocator);
         var allocator = fallback.get();
@@ -1556,8 +1649,9 @@ pub fn JSError(
         var zig_str = JSC.ZigString.init(buf);
         zig_str.detectEncoding();
         // it alwayas clones
-        exception.* = zig_str.toErrorInstance(ctx).asObjectRef();
+        const res = zig_str.toErrorInstance(globalThis);
         allocator.free(buf);
+        return res;
     }
 }
 
@@ -1571,8 +1665,8 @@ pub fn throwTypeError(
     exception.* = toTypeError(code, fmt, args, ctx).asObjectRef();
 }
 
-pub fn toTypeError(
-    code: JSC.Node.ErrorCode,
+pub fn toTypeErrorWithCode(
+    code: []const u8,
     comptime fmt: string,
     args: anytype,
     ctx: js.JSContextRef,
@@ -1588,8 +1682,17 @@ pub fn toTypeError(
         zig_str.detectEncoding();
         zig_str.mark();
     }
-    const code_str = ZigString.init(@tagName(code));
+    const code_str = ZigString.init(code);
     return JSC.JSValue.createTypeError(&zig_str, &code_str, ctx.ptr());
+}
+
+pub fn toTypeError(
+    code: JSC.Node.ErrorCode,
+    comptime fmt: string,
+    args: anytype,
+    ctx: js.JSContextRef,
+) JSC.JSValue {
+    return toTypeErrorWithCode(std.mem.span(@tagName(code)), fmt, args, ctx);
 }
 
 pub fn throwInvalidArguments(
@@ -1656,13 +1759,18 @@ pub const ArrayBuffer = extern struct {
     pub fn create(globalThis: *JSC.JSGlobalObject, bytes: []const u8, comptime kind: JSC.JSValue.JSType) JSValue {
         JSC.markBinding(@src());
         return switch (comptime kind) {
-            .Uint8Array => Bun__createUint8ArrayForCopy(globalThis, bytes.ptr, bytes.len),
+            .Uint8Array => Bun__createUint8ArrayForCopy(globalThis, bytes.ptr, bytes.len, false),
             .ArrayBuffer => Bun__createArrayBufferForCopy(globalThis, bytes.ptr, bytes.len),
             else => @compileError("Not implemented yet"),
         };
     }
 
-    extern "C" fn Bun__createUint8ArrayForCopy(*JSC.JSGlobalObject, ptr: ?*const anyopaque, len: usize) JSValue;
+    pub fn createBuffer(globalThis: *JSC.JSGlobalObject, bytes: []const u8) JSValue {
+        JSC.markBinding(@src());
+        return Bun__createUint8ArrayForCopy(globalThis, bytes.ptr, bytes.len, true);
+    }
+
+    extern "C" fn Bun__createUint8ArrayForCopy(*JSC.JSGlobalObject, ptr: ?*const anyopaque, len: usize, buffer: bool) JSValue;
     extern "C" fn Bun__createArrayBufferForCopy(*JSC.JSGlobalObject, ptr: ?*const anyopaque, len: usize) JSValue;
 
     pub fn fromTypedArray(ctx: JSC.C.JSContextRef, value: JSC.JSValue, _: JSC.C.ExceptionRef) ArrayBuffer {
@@ -1923,7 +2031,7 @@ pub const RefString = struct {
     allocator: std.mem.Allocator,
 
     ctx: ?*anyopaque = null,
-    onBeforeDeinit: ?Callback = null,
+    onBeforeDeinit: ?*const Callback = null,
 
     pub const Hash = u32;
     pub const Map = std.HashMap(Hash, *JSC.RefString, IdentityContext(Hash), 80);
@@ -2013,7 +2121,10 @@ pub const ExternalBuffer = struct {
 };
 pub export fn ExternalBuffer_deallocator(bytes_: *anyopaque, ctx: *anyopaque) callconv(.C) void {
     var external: *ExternalBuffer = bun.cast(*ExternalBuffer, ctx);
-    external.function.?(external.global, external.ctx, bytes_);
+    if (external.function) |function| {
+        function(external.global, external.ctx, bytes_);
+    }
+
     const allocator = external.allocator;
     allocator.destroy(external);
 }
@@ -2045,9 +2156,6 @@ const Expect = Test.Expect;
 const DescribeScope = Test.DescribeScope;
 const TestScope = Test.TestScope;
 const NodeFS = JSC.Node.NodeFS;
-const DirEnt = JSC.Node.DirEnt;
-const Stats = JSC.Node.Stats;
-const BigIntStats = JSC.Node.BigIntStats;
 const Transpiler = @import("./api/transpiler.zig");
 const TextEncoder = WebCore.TextEncoder;
 const TextDecoder = WebCore.TextDecoder;
@@ -2076,15 +2184,11 @@ const MD5_SHA1 = JSC.API.Bun.Crypto.MD5_SHA1;
 const FFI = JSC.FFI;
 pub const JSPrivateDataPtr = TaggedPointerUnion(.{
     AttributeIterator,
-    BigIntStats,
-    Blob,
-    Body,
     BuildError,
     Comment,
     DebugServer,
     DebugSSLServer,
     DescribeScope,
-    DirEnt,
     DocEnd,
     DocType,
     Element,
@@ -2095,17 +2199,12 @@ pub const JSPrivateDataPtr = TaggedPointerUnion(.{
     LazyPropertiesObject,
 
     ModuleNamespace,
-    NodeFS,
-    Request,
     ResolveError,
-    Response,
     Router,
     Server,
 
     SSLServer,
-    Stats,
     TextChunk,
-    Transpiler,
     FFI,
 });
 
@@ -2130,7 +2229,7 @@ pub const JSPropertyNameIterator = struct {
 pub fn getterWrap(comptime Container: type, comptime name: string) GetterType(Container) {
     return struct {
         const FunctionType = @TypeOf(@field(Container, name));
-        const FunctionTypeInfo: std.builtin.TypeInfo.Fn = @typeInfo(FunctionType).Fn;
+        const FunctionTypeInfo: std.builtin.Type.Fn = @typeInfo(FunctionType).Fn;
         const ArgsTuple = std.meta.ArgsTuple(FunctionType);
 
         pub fn callback(
@@ -2141,12 +2240,12 @@ pub fn getterWrap(comptime Container: type, comptime name: string) GetterType(Co
             exception: js.ExceptionRef,
         ) js.JSObjectRef {
             const result: JSValue = if (comptime std.meta.fields(ArgsTuple).len == 1)
-                @call(.{}, @field(Container, name), .{
+                @call(.auto, @field(Container, name), .{
                     this,
                 })
             else
-                @call(.{}, @field(Container, name), .{ this, ctx.ptr() });
-            if (!result.isUndefinedOrNull() and result.isError()) {
+                @call(.auto, @field(Container, name), .{ this, ctx.ptr() });
+            if (result.isError()) {
                 exception.* = result.asObjectRef();
                 return null;
             }
@@ -2159,7 +2258,7 @@ pub fn getterWrap(comptime Container: type, comptime name: string) GetterType(Co
 pub fn setterWrap(comptime Container: type, comptime name: string) SetterType(Container) {
     return struct {
         const FunctionType = @TypeOf(@field(Container, name));
-        const FunctionTypeInfo: std.builtin.TypeInfo.Fn = @typeInfo(FunctionType).Fn;
+        const FunctionTypeInfo: std.builtin.Type.Fn = @typeInfo(FunctionType).Fn;
 
         pub fn callback(
             this: *Container,
@@ -2169,7 +2268,7 @@ pub fn setterWrap(comptime Container: type, comptime name: string) SetterType(Co
             value: js.JSValueRef,
             exception: js.ExceptionRef,
         ) bool {
-            @call(.{}, @field(Container, name), .{ this, JSC.JSValue.fromRef(value), exception, ctx.ptr() });
+            @call(.auto, @field(Container, name), .{ this, JSC.JSValue.fromRef(value), exception, ctx.ptr() });
             return exception.* == null;
         }
     }.callback;
@@ -2370,7 +2469,7 @@ pub fn DOMCall(
             arguments_ptr: [*]const JSC.JSValue,
             arguments_len: usize,
         ) callconv(.C) JSValue {
-            return @call(.{}, @field(Container, functionName), .{
+            return @call(.auto, @field(Container, functionName), .{
                 globalObject,
                 thisValue,
                 arguments_ptr[0..arguments_len],
@@ -2382,8 +2481,8 @@ pub fn DOMCall(
         pub const Arguments = std.meta.ArgsTuple(Fastpath);
 
         pub const Export = shim.exportFunctions(.{
-            .@"slowpath" = slowpath,
-            .@"fastpath" = fastpath,
+            .slowpath = slowpath,
+            .fastpath = fastpath,
         });
 
         pub fn put(globalObject: *JSC.JSGlobalObject, value: JSValue) void {
@@ -2421,14 +2520,14 @@ pub fn DOMCall(
                     },
                     1 => {
                         try writer.writeAll(", ");
-                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].field_type));
+                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].type));
                         try writer.writeAll("));\n");
                     },
                     2 => {
                         try writer.writeAll(", ");
-                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].field_type));
+                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].type));
                         try writer.writeAll(", ");
-                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[3].field_type));
+                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[3].type));
                         try writer.writeAll("));\n");
                     },
                     else => @compileError("Must be <= 3 arguments"),
@@ -2449,14 +2548,14 @@ pub fn DOMCall(
                     },
                     1 => {
                         try writer.writeAll(", ");
-                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].field_type));
+                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].type));
                         try writer.writeAll(" arg1)) {\n");
                     },
                     2 => {
                         try writer.writeAll(", ");
-                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].field_type));
+                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[2].type));
                         try writer.writeAll(" arg1, ");
-                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[3].field_type));
+                        try writer.writeAll(DOMCallArgumentTypeWrapper(Fields[3].type));
                         try writer.writeAll(" arg2)) {\n");
                     },
                     else => @compileError("Must be <= 3 arguments"),
@@ -2499,7 +2598,7 @@ pub fn DOMCall(
                     \\  static const JSC::DOMJIT::Signature {[signatureName]s}(
                     \\    {[fastPathName]s}Wrapper,
                     \\    thisObject->classInfo(),
-                    \\    
+                    \\
                 ;
 
                 try writer.print(fmt, .{
@@ -2543,14 +2642,14 @@ pub fn DOMCall(
                 0 => {},
                 1 => {
                     try writer.writeAll(",\n  ");
-                    try writer.writeAll(DOMCallArgumentType(Fields[2].field_type));
+                    try writer.writeAll(DOMCallArgumentType(Fields[2].type));
                     try writer.writeAll("\n  ");
                 },
                 2 => {
                     try writer.writeAll(",\n  ");
-                    try writer.writeAll(DOMCallArgumentType(Fields[2].field_type));
+                    try writer.writeAll(DOMCallArgumentType(Fields[2].type));
                     try writer.writeAll(",\n  ");
-                    try writer.writeAll(DOMCallArgumentType(Fields[3].field_type));
+                    try writer.writeAll(DOMCallArgumentType(Fields[3].type));
                     try writer.writeAll("\n  ");
                 },
                 else => @compileError("Must be <= 3 arguments"),
@@ -2608,7 +2707,7 @@ pub fn wrapWithHasContainer(
 ) MethodType(Container, has_container) {
     return struct {
         const FunctionType = @TypeOf(@field(Container, name));
-        const FunctionTypeInfo: std.builtin.TypeInfo.Fn = @typeInfo(FunctionType).Fn;
+        const FunctionTypeInfo: std.builtin.Type.Fn = @typeInfo(FunctionType).Fn;
         const Args = std.meta.ArgsTuple(FunctionType);
         const eater = if (auto_protect) JSC.Node.ArgumentsSlice.protectEatNext else JSC.Node.ArgumentsSlice.nextEat;
 
@@ -2624,8 +2723,8 @@ pub fn wrapWithHasContainer(
             var args: Args = undefined;
 
             comptime var i: usize = 0;
-            inline while (i < FunctionTypeInfo.args.len) : (i += 1) {
-                const ArgType = comptime FunctionTypeInfo.args[i].arg_type.?;
+            inline while (i < FunctionTypeInfo.params.len) : (i += 1) {
+                const ArgType = comptime FunctionTypeInfo.params[i].type.?;
 
                 switch (comptime ArgType) {
                     *Container => {
@@ -2648,11 +2747,30 @@ pub fn wrapWithHasContainer(
                     },
                     ?JSC.Node.StringOrBuffer => {
                         if (iter.nextEat()) |arg| {
-                            args[i] = JSC.Node.StringOrBuffer.fromJS(ctx.ptr(), iter.arena.allocator(), arg, exception) orelse {
-                                exception.* = JSC.toInvalidArguments("expected string or buffer", .{}, ctx).asObjectRef();
-                                iter.deinit();
-                                return null;
-                            };
+                            if (!arg.isEmptyOrUndefinedOrNull()) {
+                                args[i] = JSC.Node.StringOrBuffer.fromJS(ctx.ptr(), iter.arena.allocator(), arg, exception) orelse {
+                                    exception.* = JSC.toInvalidArguments("expected string or buffer", .{}, ctx).asObjectRef();
+                                    iter.deinit();
+                                    return null;
+                                };
+                            } else {
+                                args[i] = null;
+                            }
+                        } else {
+                            args[i] = null;
+                        }
+                    },
+                    ?JSC.Node.SliceOrBuffer => {
+                        if (iter.nextEat()) |arg| {
+                            if (!arg.isEmptyOrUndefinedOrNull()) {
+                                args[i] = JSC.Node.SliceOrBuffer.fromJS(ctx.ptr(), iter.arena.allocator(), arg, exception) orelse {
+                                    exception.* = JSC.toInvalidArguments("expected string or buffer", .{}, ctx).asObjectRef();
+                                    iter.deinit();
+                                    return null;
+                                };
+                            } else {
+                                args[i] = null;
+                            }
                         } else {
                             args[i] = null;
                         }
@@ -2672,11 +2790,15 @@ pub fn wrapWithHasContainer(
                     },
                     ?JSC.ArrayBuffer => {
                         if (iter.nextEat()) |arg| {
-                            args[i] = arg.asArrayBuffer(ctx.ptr()) orelse {
-                                exception.* = JSC.toInvalidArguments("expected TypedArray", .{}, ctx).asObjectRef();
-                                iter.deinit();
-                                return null;
-                            };
+                            if (!arg.isEmptyOrUndefinedOrNull()) {
+                                args[i] = arg.asArrayBuffer(ctx.ptr()) orelse {
+                                    exception.* = JSC.toInvalidArguments("expected TypedArray", .{}, ctx).asObjectRef();
+                                    iter.deinit();
+                                    return null;
+                                };
+                            } else {
+                                args[i] = null;
+                            }
                         } else {
                             args[i] = null;
                         }
@@ -2753,24 +2875,17 @@ pub fn wrapWithHasContainer(
                 }
             }
 
-            var result: JSValue = @call(.{}, @field(Container, name), args);
-            if (!result.isEmptyOrUndefinedOrNull() and result.isError()) {
-                exception.* = result.asObjectRef();
+            var result: JSValue = @call(.auto, @field(Container, name), args);
+            if (exception.* != null) {
                 iter.deinit();
                 return null;
             }
 
             if (comptime maybe_async) {
-                if (result.asPromise() != null or result.asInternalPromise() != null) {
+                if (result.asAnyPromise()) |promise| {
                     var vm = ctx.ptr().bunVM();
-
-                    if (result.asPromise()) |promise| {
-                        vm.waitForPromise(promise);
-                        result = promise.result(ctx.vm());
-                    } else if (result.asInternalPromise()) |promise| {
-                        vm.waitForPromise(promise);
-                        result = promise.result(ctx.vm());
-                    }
+                    vm.waitForPromise(promise);
+                    result = promise.result(ctx.vm());
                 }
             }
 
@@ -2796,7 +2911,7 @@ pub fn wrapInstanceMethod(
 ) InstanceMethodType(Container) {
     return struct {
         const FunctionType = @TypeOf(@field(Container, name));
-        const FunctionTypeInfo: std.builtin.TypeInfo.Fn = @typeInfo(FunctionType).Fn;
+        const FunctionTypeInfo: std.builtin.Type.Fn = @typeInfo(FunctionType).Fn;
         const Args = std.meta.ArgsTuple(FunctionType);
         const eater = if (auto_protect) JSC.Node.ArgumentsSlice.protectEatNext else JSC.Node.ArgumentsSlice.nextEat;
 
@@ -2805,13 +2920,13 @@ pub fn wrapInstanceMethod(
             globalThis: *JSC.JSGlobalObject,
             callframe: *JSC.CallFrame,
         ) callconv(.C) JSC.JSValue {
-            const arguments = callframe.arguments(FunctionTypeInfo.args.len);
+            const arguments = callframe.arguments(FunctionTypeInfo.params.len);
             var iter = JSC.Node.ArgumentsSlice.init(globalThis.bunVM(), arguments.ptr[0..arguments.len]);
             var args: Args = undefined;
 
             comptime var i: usize = 0;
-            inline while (i < FunctionTypeInfo.args.len) : (i += 1) {
-                const ArgType = comptime FunctionTypeInfo.args[i].arg_type.?;
+            inline while (i < FunctionTypeInfo.params.len) : (i += 1) {
+                const ArgType = comptime FunctionTypeInfo.params[i].type.?;
 
                 switch (comptime ArgType) {
                     *Container => {
@@ -2834,11 +2949,30 @@ pub fn wrapInstanceMethod(
                     },
                     ?JSC.Node.StringOrBuffer => {
                         if (iter.nextEat()) |arg| {
-                            args[i] = JSC.Node.StringOrBuffer.fromJS(globalThis.ptr(), iter.arena.allocator(), arg, null) orelse {
-                                globalThis.throwInvalidArguments("expected string or buffer", .{});
-                                iter.deinit();
-                                return JSC.JSValue.zero;
-                            };
+                            if (!arg.isEmptyOrUndefinedOrNull()) {
+                                args[i] = JSC.Node.StringOrBuffer.fromJS(globalThis.ptr(), iter.arena.allocator(), arg, null) orelse {
+                                    globalThis.throwInvalidArguments("expected string or buffer", .{});
+                                    iter.deinit();
+                                    return JSC.JSValue.zero;
+                                };
+                            } else {
+                                args[i] = null;
+                            }
+                        } else {
+                            args[i] = null;
+                        }
+                    },
+                    ?JSC.Node.SliceOrBuffer => {
+                        if (iter.nextEat()) |arg| {
+                            if (!arg.isEmptyOrUndefinedOrNull()) {
+                                args[i] = JSC.Node.SliceOrBuffer.fromJS(globalThis.ptr(), iter.arena.allocator(), arg) orelse {
+                                    globalThis.throwInvalidArguments("expected string or buffer", .{});
+                                    iter.deinit();
+                                    return JSC.JSValue.zero;
+                                };
+                            } else {
+                                args[i] = null;
+                            }
                         } else {
                             args[i] = null;
                         }
@@ -2930,7 +3064,7 @@ pub fn wrapInstanceMethod(
 
             defer iter.deinit();
 
-            return @call(.{}, @field(Container, name), args);
+            return @call(.auto, @field(Container, name), args);
         }
     }.method;
 }
@@ -2942,7 +3076,7 @@ pub fn wrapStaticMethod(
 ) JSC.Codegen.StaticCallbackType {
     return struct {
         const FunctionType = @TypeOf(@field(Container, name));
-        const FunctionTypeInfo: std.builtin.TypeInfo.Fn = @typeInfo(FunctionType).Fn;
+        const FunctionTypeInfo: std.builtin.Type.Fn = @typeInfo(FunctionType).Fn;
         const Args = std.meta.ArgsTuple(FunctionType);
         const eater = if (auto_protect) JSC.Node.ArgumentsSlice.protectEatNext else JSC.Node.ArgumentsSlice.nextEat;
 
@@ -2950,13 +3084,13 @@ pub fn wrapStaticMethod(
             globalThis: *JSC.JSGlobalObject,
             callframe: *JSC.CallFrame,
         ) callconv(.C) JSC.JSValue {
-            const arguments = callframe.arguments(FunctionTypeInfo.args.len);
+            const arguments = callframe.arguments(FunctionTypeInfo.params.len);
             var iter = JSC.Node.ArgumentsSlice.init(globalThis.bunVM(), arguments.ptr[0..arguments.len]);
             var args: Args = undefined;
 
             comptime var i: usize = 0;
-            inline while (i < FunctionTypeInfo.args.len) : (i += 1) {
-                const ArgType = comptime FunctionTypeInfo.args[i].arg_type.?;
+            inline while (i < FunctionTypeInfo.params.len) : (i += 1) {
+                const ArgType = comptime FunctionTypeInfo.params[i].type.?;
 
                 switch (comptime ArgType) {
                     *JSC.JSGlobalObject => {
@@ -3072,57 +3206,9 @@ pub fn wrapStaticMethod(
 
             defer iter.deinit();
 
-            return @call(.{}, @field(Container, name), args);
+            return @call(.auto, @field(Container, name), args);
         }
     }.method;
-}
-
-pub fn cachedBoundFunction(comptime name: [:0]const u8, comptime callback: anytype) (fn (
-    _: void,
-    ctx: js.JSContextRef,
-    _: js.JSValueRef,
-    _: js.JSStringRef,
-    _: js.ExceptionRef,
-) js.JSValueRef) {
-    return struct {
-        const name_ = name;
-        pub fn call(
-            arg2: js.JSContextRef,
-            arg3: js.JSObjectRef,
-            arg4: js.JSObjectRef,
-            arg5: usize,
-            arg6: [*c]const js.JSValueRef,
-            arg7: js.ExceptionRef,
-        ) callconv(.C) js.JSObjectRef {
-            return callback(
-                {},
-                arg2,
-                arg3,
-                arg4,
-                arg6[0..arg5],
-                arg7,
-            );
-        }
-
-        pub fn getter(
-            _: void,
-            ctx: js.JSContextRef,
-            _: js.JSValueRef,
-            _: js.JSStringRef,
-            _: js.ExceptionRef,
-        ) js.JSValueRef {
-            const name_slice = std.mem.span(name_);
-            var existing = ctx.ptr().getCachedObject(&ZigString.init(name_slice));
-            if (existing.isEmpty()) {
-                return ctx.ptr().putCachedObject(
-                    &ZigString.init(name_slice),
-                    JSValue.fromRef(JSC.C.JSObjectMakeFunctionWithCallback(ctx, JSC.C.JSStringCreateStatic(name_slice.ptr, name_slice.len), call)),
-                ).asObjectRef();
-            }
-
-            return existing.asObjectRef();
-        }
-    }.getter;
 }
 
 /// Track whether an object should keep the event loop alive
@@ -3163,7 +3249,7 @@ pub const PollRef = struct {
 
     /// Make calling ref() on this poll into a no-op.
     pub fn disable(this: *PollRef) void {
-        this.unref(JSC.VirtualMachine.vm);
+        this.unref(JSC.VirtualMachine.get());
         this.status = .done;
     }
 
@@ -3196,19 +3282,22 @@ pub const PollRef = struct {
         if (this.status != .active)
             return;
         this.status = .inactive;
-        log("unref", .{});
-        vm.uws_event_loop.?.num_polls -= 1;
-        vm.uws_event_loop.?.active -= 1;
+        vm.uws_event_loop.?.unref();
+    }
+    /// Prevent a poll from keeping the process alive on the next tick.
+    pub fn unrefOnNextTick(this: *PollRef, vm: *JSC.VirtualMachine) void {
+        if (this.status != .active)
+            return;
+        this.status = .inactive;
+        vm.pending_unref_counter +|= 1;
     }
 
     /// Allow a poll to keep the process alive.
     pub fn ref(this: *PollRef, vm: *JSC.VirtualMachine) void {
         if (this.status != .inactive)
             return;
-        log("ref", .{});
         this.status = .active;
-        vm.uws_event_loop.?.num_polls += 1;
-        vm.uws_event_loop.?.active += 1;
+        vm.uws_event_loop.?.ref();
     }
 };
 
@@ -3218,7 +3307,7 @@ pub const FilePoll = struct {
 
     fd: u32 = invalid_fd,
     flags: Flags.Set = Flags.Set{},
-    owner: Owner = Deactivated.owner,
+    owner: Owner = undefined,
 
     /// We re-use FilePoll objects to avoid allocating new ones.
     ///
@@ -3233,8 +3322,10 @@ pub const FilePoll = struct {
     const Subprocess = JSC.Subprocess;
     const BufferedInput = Subprocess.BufferedInput;
     const BufferedOutput = Subprocess.BufferedOutput;
+    const DNSResolver = JSC.DNS.DNSResolver;
+    const GetAddrInfoRequest = JSC.DNS.GetAddrInfoRequest;
     const Deactivated = opaque {
-        pub var owner = Owner.init(@intToPtr(*Deactivated, @as(usize, 0xDEADBEEF)));
+        pub var owner: Owner = Owner.init(@intToPtr(*Deactivated, @as(usize, 0xDEADBEEF)));
     };
 
     pub const Owner = bun.TaggedPointerUnion(.{
@@ -3244,6 +3335,8 @@ pub const FilePoll = struct {
         BufferedInput,
         FIFO,
         Deactivated,
+        DNSResolver,
+        GetAddrInfoRequest,
     });
 
     fn updateFlags(poll: *FilePoll, updated: Flags.Set) void {
@@ -3251,6 +3344,7 @@ pub const FilePoll = struct {
         flags.remove(.readable);
         flags.remove(.writable);
         flags.remove(.process);
+        flags.remove(.machport);
         flags.remove(.eof);
         flags.remove(.hup);
 
@@ -3300,23 +3394,28 @@ pub const FilePoll = struct {
     }
 
     pub fn deinit(this: *FilePoll) void {
-        var vm = JSC.VirtualMachine.vm;
+        var vm = JSC.VirtualMachine.get();
         this.deinitWithVM(vm);
     }
 
-    pub fn deinitWithVM(this: *FilePoll, vm: *JSC.VirtualMachine) void {
+    pub fn deinitWithoutVM(this: *FilePoll, loop: *uws.Loop, polls: *JSC.FilePoll.HiveArray) void {
         if (this.isRegistered()) {
-            _ = this.unregister(vm.uws_event_loop.?);
+            _ = this.unregister(loop);
         }
 
         this.owner = Deactivated.owner;
         this.flags = Flags.Set{};
         this.fd = invalid_fd;
-        vm.rareData().filePolls(vm).put(this);
+        polls.put(this);
+    }
+
+    pub fn deinitWithVM(this: *FilePoll, vm: *JSC.VirtualMachine) void {
+        var loop = vm.uws_event_loop.?;
+        this.deinitWithoutVM(loop, vm.rareData().filePolls(vm));
     }
 
     pub fn isRegistered(this: *const FilePoll) bool {
-        return this.flags.contains(.poll_writable) or this.flags.contains(.poll_readable) or this.flags.contains(.poll_process);
+        return this.flags.contains(.poll_writable) or this.flags.contains(.poll_readable) or this.flags.contains(.poll_process) or this.flags.contains(.poll_machport);
     }
 
     const kqueue_or_epoll = if (Environment.isMac) "kevent" else "epoll";
@@ -3344,6 +3443,18 @@ pub const FilePoll = struct {
                 loader.onPoll(size_or_offset, 0);
             },
 
+            @field(Owner.Tag, "DNSResolver") => {
+                log("onUpdate " ++ kqueue_or_epoll ++ " (fd: {d}) DNSResolver", .{poll.fd});
+                var loader: *DNSResolver = ptr.as(DNSResolver);
+                loader.onDNSPoll(poll);
+            },
+
+            @field(Owner.Tag, "GetAddrInfoRequest") => {
+                log("onUpdate " ++ kqueue_or_epoll ++ " (fd: {d}) GetAddrInfoRequest", .{poll.fd});
+                var loader: *GetAddrInfoRequest = ptr.as(GetAddrInfoRequest);
+                loader.onMachportChange();
+            },
+
             else => {
                 log("onUpdate " ++ kqueue_or_epoll ++ " (fd: {d}) disconnected?", .{poll.fd});
             },
@@ -3362,12 +3473,16 @@ pub const FilePoll = struct {
         /// Poll for process-related events
         poll_process,
 
+        /// Poll for machport events
+        poll_machport,
+
         // What did the event loop tell us?
         readable,
         writable,
         process,
         eof,
         hup,
+        machport,
 
         // What is the type of file descriptor?
         fifo,
@@ -3387,6 +3502,7 @@ pub const FilePoll = struct {
                 .readable => .poll_readable,
                 .writable => .poll_writable,
                 .process => .poll_process,
+                .machport => .poll_machport,
                 else => this,
             };
         }
@@ -3413,6 +3529,9 @@ pub const FilePoll = struct {
             } else if (kqueue_event.filter == std.os.system.EVFILT_PROC) {
                 log("proc", .{});
                 flags.insert(Flags.process);
+            } else if (kqueue_event.filter == std.os.system.EVFILT_MACHPORT) {
+                log("machport", .{});
+                flags.insert(Flags.machport);
             }
             return flags;
         }
@@ -3563,17 +3682,20 @@ pub const FilePoll = struct {
     const timeout = std.mem.zeroes(std.os.timespec);
     const kevent = std.c.kevent;
     const linux = std.os.linux;
+
     pub fn register(this: *FilePoll, loop: *uws.Loop, flag: Flags, one_shot: bool) JSC.Maybe(void) {
+        return registerWithFd(this, loop, flag, one_shot, this.fd);
+    }
+    pub fn registerWithFd(this: *FilePoll, loop: *uws.Loop, flag: Flags, one_shot: bool, fd: u64) JSC.Maybe(void) {
         const watcher_fd = loop.fd;
-        const fd = this.fd;
 
         log("register: {s} ({d})", .{ @tagName(flag), fd });
+
+        std.debug.assert(fd != invalid_fd);
 
         if (one_shot) {
             this.flags.insert(.one_shot);
         }
-
-        std.debug.assert(this.fd != invalid_fd);
 
         if (comptime Environment.isLinux) {
             const one_shot_flag: u32 = if (!this.flags.contains(.one_shot)) 0 else linux.EPOLL.ONESHOT;
@@ -3625,6 +3747,15 @@ pub const FilePoll = struct {
                     .filter = std.os.system.EVFILT_PROC,
                     .data = 0,
                     .fflags = std.c.NOTE_EXIT,
+                    .udata = @ptrToInt(Pollable.init(this).ptr()),
+                    .flags = std.c.EV_ADD | one_shot_flag,
+                    .ext = .{ this.generation_number, 0 },
+                },
+                .machport => .{
+                    .ident = @intCast(u64, fd),
+                    .filter = std.os.system.EVFILT_MACHPORT,
+                    .data = 0,
+                    .fflags = 0,
                     .udata = @ptrToInt(Pollable.init(this).ptr()),
                     .flags = std.c.EV_ADD | one_shot_flag,
                     .ext = .{ this.generation_number, 0 },
@@ -3684,6 +3815,7 @@ pub const FilePoll = struct {
             .readable => .poll_readable,
             .process => if (comptime Environment.isLinux) .poll_readable else .poll_process,
             .writable => .poll_writable,
+            .machport => .poll_machport,
             else => unreachable,
         });
         this.flags.remove(.needs_rearm);
@@ -3694,12 +3826,15 @@ pub const FilePoll = struct {
     const invalid_fd = bun.invalid_fd;
 
     pub fn unregister(this: *FilePoll, loop: *uws.Loop) JSC.Maybe(void) {
-        if (!(this.flags.contains(.poll_readable) or this.flags.contains(.poll_writable) or this.flags.contains(.poll_process))) {
+        return this.unregisterWithFd(loop, this.fd);
+    }
+
+    pub fn unregisterWithFd(this: *FilePoll, loop: *uws.Loop, fd: u64) JSC.Maybe(void) {
+        if (!(this.flags.contains(.poll_readable) or this.flags.contains(.poll_writable) or this.flags.contains(.poll_process) or this.flags.contains(.poll_machport))) {
             // no-op
             return JSC.Maybe(void).success;
         }
 
-        const fd = this.fd;
         std.debug.assert(fd != invalid_fd);
         const watcher_fd = loop.fd;
         const flag: Flags = brk: {
@@ -3709,6 +3844,9 @@ pub const FilePoll = struct {
                 break :brk .writable;
             if (this.flags.contains(.poll_process))
                 break :brk .process;
+
+            if (this.flags.contains(.poll_machport))
+                break :brk .machport;
             return JSC.Maybe(void).success;
         };
 
@@ -3717,6 +3855,7 @@ pub const FilePoll = struct {
             this.flags.remove(.poll_process);
             this.flags.remove(.poll_readable);
             this.flags.remove(.poll_process);
+            this.flags.remove(.poll_machport);
             return JSC.Maybe(void).success;
         }
 
@@ -3740,6 +3879,15 @@ pub const FilePoll = struct {
                 .readable => .{
                     .ident = @intCast(u64, fd),
                     .filter = std.os.system.EVFILT_READ,
+                    .data = 0,
+                    .fflags = 0,
+                    .udata = @ptrToInt(Pollable.init(this).ptr()),
+                    .flags = std.c.EV_DELETE,
+                    .ext = .{ 0, 0 },
+                },
+                .machport => .{
+                    .ident = @intCast(u64, fd),
+                    .filter = std.os.system.EVFILT_MACHPORT,
                     .data = 0,
                     .fflags = 0,
                     .udata = @ptrToInt(Pollable.init(this).ptr()),
@@ -3809,6 +3957,7 @@ pub const FilePoll = struct {
         this.flags.remove(.poll_readable);
         this.flags.remove(.poll_writable);
         this.flags.remove(.poll_process);
+        this.flags.remove(.poll_machport);
 
         if (this.isActive())
             this.deactivate(loop);
@@ -3887,5 +4036,95 @@ pub const Strong = extern struct {
         var ref: *JSC.napi.Ref = this.ref orelse return;
         this.ref = null;
         ref.destroy();
+    }
+};
+
+pub const BinaryType = enum {
+    Buffer,
+    ArrayBuffer,
+    Uint8Array,
+    Uint16Array,
+    Uint32Array,
+    Int8Array,
+    Int16Array,
+    Int32Array,
+    Float32Array,
+    Float64Array,
+    // DataView,
+
+    pub fn toJSType(this: BinaryType) JSC.JSValue.JSType {
+        return switch (this) {
+            .ArrayBuffer => .ArrayBuffer,
+            .Buffer => .Uint8Array,
+            // .DataView => .DataView,
+            .Float32Array => .Float32Array,
+            .Float64Array => .Float64Array,
+            .Int16Array => .Int16Array,
+            .Int32Array => .Int32Array,
+            .Int8Array => .Int8Array,
+            .Uint16Array => .Uint16Array,
+            .Uint32Array => .Uint32Array,
+            .Uint8Array => .Uint8Array,
+        };
+    }
+
+    pub fn toTypedArrayType(this: BinaryType) JSC.C.JSTypedArrayType {
+        return this.toJSType().toC();
+    }
+
+    const Map = bun.ComptimeStringMap(
+        BinaryType,
+        .{
+            .{ "ArrayBuffer", .ArrayBuffer },
+            .{ "Buffer", .Buffer },
+            // .{ "DataView", .DataView },
+            .{ "Float32Array", .Float32Array },
+            .{ "Float64Array", .Float64Array },
+            .{ "Int16Array", .Int16Array },
+            .{ "Int32Array", .Int32Array },
+            .{ "Int8Array", .Int8Array },
+            .{ "Uint16Array", .Uint16Array },
+            .{ "Uint32Array", .Uint32Array },
+            .{ "Uint8Array", .Uint8Array },
+            .{ "arraybuffer", .ArrayBuffer },
+            .{ "buffer", .Buffer },
+            // .{ "dataview", .DataView },
+            .{ "float32array", .Float32Array },
+            .{ "float64array", .Float64Array },
+            .{ "int16array", .Int16Array },
+            .{ "int32array", .Int32Array },
+            .{ "int8array", .Int8Array },
+            .{ "nodebuffer", .Buffer },
+            .{ "uint16array", .Uint16Array },
+            .{ "uint32array", .Uint32Array },
+            .{ "uint8array", .Uint8Array },
+        },
+    );
+
+    pub fn fromString(input: []const u8) ?BinaryType {
+        return Map.get(input);
+    }
+
+    pub fn fromJSValue(globalThis: *JSC.JSGlobalObject, input: JSValue) ?BinaryType {
+        if (input.isString()) {
+            return Map.getWithEql(input.getZigString(globalThis), ZigString.eqlComptime);
+        }
+
+        return null;
+    }
+
+    /// This clones bytes
+    pub fn toJS(this: BinaryType, bytes: []const u8, globalThis: *JSC.JSGlobalObject) JSValue {
+        switch (this) {
+            .Buffer => return JSC.ArrayBuffer.createBuffer(globalThis, bytes),
+            .ArrayBuffer => return JSC.ArrayBuffer.create(globalThis, bytes, .ArrayBuffer),
+            .Uint8Array => return JSC.ArrayBuffer.create(globalThis, bytes, .Uint8Array),
+
+            // These aren't documented, but they are supported
+            .Uint16Array, .Uint32Array, .Int8Array, .Int16Array, .Int32Array, .Float32Array, .Float64Array => {
+                const buffer = JSC.ArrayBuffer.create(globalThis, bytes, .ArrayBuffer);
+                return JSC.JSValue.c(JSC.C.JSObjectMakeTypedArrayWithArrayBuffer(globalThis, this.toTypedArrayType(), buffer.asObjectRef(), null));
+            },
+        }
     }
 };

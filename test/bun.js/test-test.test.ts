@@ -1,5 +1,11 @@
-import { expect, test } from "bun:test";
-import { OnigurumaRegExp } from "bun";
+import { spawn, spawnSync } from "bun";
+import { describe, expect, it, test } from "bun:test";
+import { bunEnv } from "bunEnv";
+import { bunExe } from "bunExe";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "fs";
+import { mkdtemp, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 
 test("toStrictEqual() vs toEqual()", () => {
   expect([1, , 3]).toEqual([1, , 3]);
@@ -133,15 +139,35 @@ function f2() {
   return "hey!";
 }
 test("deepEquals regex", () => {
-  expect(new OnigurumaRegExp("s", "g")).toEqual(new OnigurumaRegExp("s", "g"));
-  expect(new OnigurumaRegExp("s", "g")).not.toEqual(
-    new OnigurumaRegExp("s", "i"),
-  );
   expect(/a/imu).toEqual(/a/imu);
   expect(/a/imu).not.toEqual(/ab/imu);
 
   expect(new RegExp("s", "g")).toEqual(new RegExp("s", "g"));
   expect(new RegExp("s", "g")).not.toEqual(new RegExp("s", "i"));
+});
+
+test("toThrow", () => {
+  expect(() => {
+    throw new Error("hello");
+  }).toThrow("hello");
+
+  var err = new Error("bad");
+  expect(() => {
+    throw err;
+  }).toThrow(err);
+
+  var err = new Error("good");
+  expect(() => {
+    throw err;
+  }).toThrow();
+
+  expect(() => {
+    return true;
+  }).not.toThrow();
+
+  expect(() => {
+    return true;
+  }).not.toThrow(err);
 });
 
 test("deepEquals derived strings and strings", () => {
@@ -1179,25 +1205,15 @@ test("toHaveProperty() - with string or array", () => {
   expect(houseForSale).toHaveProperty("bedrooms", 4);
   expect(houseForSale).toHaveProperty(["sunroom"], "yes");
   expect(houseForSale).toHaveProperty("kitchen.area", 20);
-  expect(houseForSale).toHaveProperty("kitchen.amenities", [
-    "oven",
-    "stove",
-    "washer",
-  ]);
+  expect(houseForSale).toHaveProperty("kitchen.amenities", ["oven", "stove", "washer"]);
   expect(houseForSale).not.toHaveProperty(["kitchen", "area"], 21);
   expect(houseForSale).toHaveProperty(["kitchen", "area"], 20);
   expect(houseForSale).not.toHaveProperty(["kitchen", "area"], 29);
-  expect(houseForSale).toHaveProperty(
-    ["kitchen", "amenities"],
-    ["oven", "stove", "washer"],
-  );
+  expect(houseForSale).toHaveProperty(["kitchen", "amenities"], ["oven", "stove", "washer"]);
   expect(houseForSale).toHaveProperty("kitchen.amenities[2]", "washer");
   expect(houseForSale).toHaveProperty(["kitchen", "amenities", 1], "stove");
   expect(houseForSale).toHaveProperty(["kitchen", "amenities", 0], "oven");
-  expect(houseForSale).toHaveProperty(
-    "livingroom.amenities[0].couch[0][1].dimensions[0]",
-    20,
-  );
+  expect(houseForSale).toHaveProperty("livingroom.amenities[0].couch[0][1].dimensions[0]", 20);
   expect(houseForSale).toHaveProperty(["kitchen", "nice.oven"]);
   expect(houseForSale).not.toHaveProperty(["kitchen", "open"]);
   expect(houseForSale).toHaveProperty(["ceiling.height"], 20);
@@ -1301,10 +1317,7 @@ test("toHaveProperty() - all", () => {
 
   // test object with property "a" with value set, map, string
   expect({ a: new Set([1, 2, 3]) }).toHaveProperty("a", new Set([3, 2, 1]));
-  expect({ a: new Map([{ a: 1 }, { b: 2 }, { c: 3 }]) }).toHaveProperty(
-    "a",
-    new Map([{ c: 3 }, { b: 2 }, { a: 1 }]),
-  );
+  expect({ a: new Map([{ a: 1 }, { b: 2 }, { c: 3 }]) }).toHaveProperty("a", new Map([{ c: 3 }, { b: 2 }, { a: 1 }]));
   expect({ a: new String("a") }).toHaveProperty("a", new String("a"));
   expect({ a: new String("a") }).not.toHaveProperty("a", "a");
   expect({ a: new String("a") }).not.toHaveProperty("a", "b");
@@ -1324,10 +1337,7 @@ test("toHaveProperty() - all", () => {
   expect({ a: new String("a") }).not.toHaveProperty("a", Symbol("a"));
   expect({ a: new String("a") }).not.toHaveProperty("a", new Int8Array());
   expect({ a: new String("a") }).not.toHaveProperty("a", new Uint8Array());
-  expect({ a: new String("a") }).not.toHaveProperty(
-    "a",
-    new Uint8ClampedArray(),
-  );
+  expect({ a: new String("a") }).not.toHaveProperty("a", new Uint8ClampedArray());
   expect({ a: new String("a") }).not.toHaveProperty("a", new Int16Array());
   expect({ a: new String("a") }).not.toHaveProperty("a", new Uint16Array());
   expect({ a: new String("a") }).not.toHaveProperty("a", new Int32Array());
@@ -1337,21 +1347,12 @@ test("toHaveProperty() - all", () => {
   expect({ a: new String("a") }).not.toHaveProperty("a", new BigInt64Array());
   expect({ a: new String("a") }).not.toHaveProperty("a", new BigUint64Array());
   expect({ a: new String("a") }).not.toHaveProperty("a", new ArrayBuffer());
-  expect({ a: new String("a") }).not.toHaveProperty(
-    "a",
-    new SharedArrayBuffer(),
-  );
-  expect({ a: new String("a") }).not.toHaveProperty(
-    "a",
-    new DataView(new ArrayBuffer(1)),
-  );
+  expect({ a: new String("a") }).not.toHaveProperty("a", new SharedArrayBuffer());
+  expect({ a: new String("a") }).not.toHaveProperty("a", new DataView(new ArrayBuffer(1)));
 
   // test property equality with sets, maps, objects, arrays, and String
   expect({ a: new Set([1, 2, 3]) }).toHaveProperty("a", new Set([1, 2, 3]));
-  expect({ a: new Map([{ a: 1 }, { b: 2 }, { c: 3 }]) }).toHaveProperty(
-    "a",
-    new Map([{ a: 1 }, { b: 2 }, { c: 3 }]),
-  );
+  expect({ a: new Map([{ a: 1 }, { b: 2 }, { c: 3 }]) }).toHaveProperty("a", new Map([{ a: 1 }, { b: 2 }, { c: 3 }]));
   expect({ a: { a: 1, b: 2, c: 3 } }).toHaveProperty("a", { a: 1, b: 2, c: 3 });
   expect({ a: [1, 2, 3] }).toHaveProperty("a", [1, 2, 3]);
   expect({ a: "a" }).toHaveProperty("a", "a");
@@ -1386,9 +1387,7 @@ test("toBe()", () => {
 });
 
 test("toHaveLength()", () => {
-  expect({ length: Number.MAX_SAFE_INTEGER }).toHaveLength(
-    Number.MAX_SAFE_INTEGER,
-  );
+  expect({ length: Number.MAX_SAFE_INTEGER }).toHaveLength(Number.MAX_SAFE_INTEGER);
   expect("123").toHaveLength(3);
   expect([1, 2, 3]).toHaveLength(3);
   expect([1, 2, 3]).not.toHaveLength(2);
@@ -1396,9 +1395,7 @@ test("toHaveLength()", () => {
   expect({ length: 3 }).toHaveLength(3);
   expect({ length: 3 }).not.toHaveLength(2);
   expect({ length: 3 }).not.toHaveLength(Number.MAX_SAFE_INTEGER);
-  expect({ length: Number.MAX_SAFE_INTEGER }).not.toHaveLength(
-    Number.MAX_SAFE_INTEGER - 1,
-  );
+  expect({ length: Number.MAX_SAFE_INTEGER }).not.toHaveLength(Number.MAX_SAFE_INTEGER - 1);
   expect({ length: 3.3 }).not.toHaveLength(3);
   expect("123").not.toHaveLength(-0);
 });
@@ -1518,9 +1515,7 @@ test("toBeGreaterThan()", () => {
   expect(1).not.toBeGreaterThan(Number.MAX_SAFE_INTEGER);
   expect(1).not.toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
   expect(Number.MAX_SAFE_INTEGER).not.toBeGreaterThan(Number.MAX_SAFE_INTEGER);
-  expect(BigInt(Number.MAX_SAFE_INTEGER)).not.toBeGreaterThan(
-    BigInt(Number.MAX_SAFE_INTEGER),
-  );
+  expect(BigInt(Number.MAX_SAFE_INTEGER)).not.toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
 
   expect(Infinity).toBeGreaterThan(-Infinity);
   expect(-Infinity).not.toBeGreaterThan(Infinity);
@@ -1630,12 +1625,8 @@ test("toBeGreaterThanOrEqual()", () => {
   expect(1).not.toBeGreaterThanOrEqual(Number.MAX_SAFE_INTEGER);
   expect(1).not.toBeGreaterThanOrEqual(BigInt(Number.MAX_SAFE_INTEGER));
   expect(1).not.toBeGreaterThanOrEqual(BigInt(Number.MAX_VALUE));
-  expect(Number.MAX_SAFE_INTEGER).toBeGreaterThanOrEqual(
-    Number.MAX_SAFE_INTEGER,
-  );
-  expect(BigInt(Number.MAX_SAFE_INTEGER)).toBeGreaterThanOrEqual(
-    BigInt(Number.MAX_SAFE_INTEGER),
-  );
+  expect(Number.MAX_SAFE_INTEGER).toBeGreaterThanOrEqual(Number.MAX_SAFE_INTEGER);
+  expect(BigInt(Number.MAX_SAFE_INTEGER)).toBeGreaterThanOrEqual(BigInt(Number.MAX_SAFE_INTEGER));
 
   expect(Infinity).toBeGreaterThanOrEqual(-Infinity);
   expect(-Infinity).not.toBeGreaterThanOrEqual(Infinity);
@@ -1740,9 +1731,7 @@ test("toBeLessThan()", () => {
   expect(1).toBeLessThan(Number.MAX_SAFE_INTEGER);
   expect(1).toBeLessThan(BigInt(Number.MAX_SAFE_INTEGER));
   expect(Number.MAX_SAFE_INTEGER).not.toBeLessThan(Number.MAX_SAFE_INTEGER);
-  expect(BigInt(Number.MAX_SAFE_INTEGER)).not.toBeLessThan(
-    BigInt(Number.MAX_SAFE_INTEGER),
-  );
+  expect(BigInt(Number.MAX_SAFE_INTEGER)).not.toBeLessThan(BigInt(Number.MAX_SAFE_INTEGER));
 
   expect(Number.MAX_VALUE).not.toBeLessThan(BigInt(Number.MAX_VALUE));
 
@@ -1853,9 +1842,7 @@ test("toBeLessThanOrEqual()", () => {
   expect(1).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
   expect(1).toBeLessThanOrEqual(BigInt(Number.MAX_SAFE_INTEGER));
   expect(Number.MAX_SAFE_INTEGER).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
-  expect(BigInt(Number.MAX_SAFE_INTEGER)).toBeLessThanOrEqual(
-    BigInt(Number.MAX_SAFE_INTEGER),
-  );
+  expect(BigInt(Number.MAX_SAFE_INTEGER)).toBeLessThanOrEqual(BigInt(Number.MAX_SAFE_INTEGER));
 
   expect(Number.MAX_VALUE).toBeLessThanOrEqual(BigInt(Number.MAX_VALUE));
   expect(BigInt(Number.MAX_VALUE)).toBeLessThanOrEqual(Number.MAX_VALUE);
@@ -1967,3 +1954,139 @@ try {
 try {
   test();
 } catch (e) {}
+
+describe("throw in describe scope doesn't enqueue tests after thrown", () => {
+  it("test enqueued before a describe scope throws is never run", () => {
+    throw new Error("This test failed");
+  });
+
+  class TestPass extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "TestPass";
+    }
+  }
+
+  throw new TestPass("This test passed. Ignore the error message");
+
+  it("test enqueued after a describe scope throws is never run", () => {
+    throw new Error("This test failed");
+  });
+});
+
+it("a describe scope throwing doesn't cause all other tests in the file to fail", () => {
+  expect(true).toBe(true);
+});
+
+test("test async exceptions fail tests", () => {
+  const code = `
+  import {test, expect} from 'bun:test';
+  import {EventEmitter} from 'events';
+  test('test throwing inside an EventEmitter fails the test', () => {
+    const emitter = new EventEmitter();
+    emitter.on('event', () => {
+      throw new Error('test throwing inside an EventEmitter #FAIL001');
+    });
+    emitter.emit('event');
+  });
+
+  test('test throwing inside a queueMicrotask callback fails', async () => {
+
+    queueMicrotask(() => {
+      throw new Error('test throwing inside an EventEmitter #FAIL002');
+    });
+
+    await 1;
+  });
+
+  test('test throwing inside a process.nextTick callback fails', async () => {
+
+    process.nextTick(() => {
+      throw new Error('test throwing inside an EventEmitter #FAIL003');
+    });
+
+    await 1;
+  });
+
+  test('test throwing inside a setTimeout', async () => {
+    await new Promise((resolve, reject) => {
+      setTimeout(() => {
+        resolve();
+        throw new Error('test throwing inside an EventEmitter #FAIL004');
+      }, 0);
+    });
+  });
+
+  test('test throwing inside an async setTimeout', async () => {
+    await new Promise((resolve, reject) => {
+      setTimeout(async () => {
+        await 1;
+        resolve();
+        throw new Error('test throwing inside an EventEmitter #FAIL005');
+      }, 0);
+    });
+  });
+
+
+  test('test throwing inside an async setTimeout no await' , async () => {
+    await new Promise((resolve, reject) => {
+      setTimeout(async () => {
+        resolve();
+        throw new Error('test throwing inside an EventEmitter #FAIL006');
+      }, 0);
+    });
+  });
+
+  `;
+
+  rmSync("/tmp/test-throwing-bun/test-throwing-eventemitter.test.js", {
+    force: true,
+  });
+
+  try {
+    mkdirSync("/tmp/test-throwing-bun", { recursive: true });
+  } catch (e) {}
+  writeFileSync("/tmp/test-throwing-bun/test-throwing-eventemitter.test.js", code);
+
+  const { stderr, exitCode } = spawnSync([bunExe(), "wiptest", "test-throwing-eventemitter"], {
+    cwd: realpathSync("/tmp/test-throwing-bun"),
+    env: bunEnv,
+  });
+
+  const str = stderr!.toString();
+  expect(str).toContain("#FAIL001");
+  expect(str).toContain("#FAIL002");
+  expect(str).toContain("#FAIL003");
+  expect(str).toContain("#FAIL004");
+  expect(str).toContain("#FAIL005");
+  expect(str).toContain("#FAIL006");
+  expect(str).toContain("6 fail");
+  expect(str).toContain("0 pass");
+
+  expect(exitCode).toBe(1);
+});
+
+it("should return non-zero exit code for invalid syntax", async () => {
+  const test_dir = realpathSync(await mkdtemp(join(tmpdir(), "test")));
+  try {
+    await writeFile(join(test_dir, "bad.test.js"), "!!!");
+    const { stdout, stderr, exited } = spawn({
+      cmd: [bunExe(), "wiptest", "bad.test.js"],
+      cwd: test_dir,
+      stdout: null,
+      stdin: "pipe",
+      stderr: "pipe",
+      bunEnv,
+    });
+    const err = await new Response(stderr).text();
+    expect(err).toContain("error: Unexpected end of file");
+    expect(err).toContain(" 0 pass");
+    expect(err).toContain(" 1 fail");
+    expect(err).toContain("Ran 1 tests across 1 files");
+    expect(stdout).toBeDefined();
+    expect(await new Response(stdout).text()).toBe("");
+    expect(await exited).toBe(1);
+  } finally {
+    await rm(test_dir, { force: true, recursive: true });
+  }
+});

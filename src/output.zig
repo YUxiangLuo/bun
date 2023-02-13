@@ -233,6 +233,9 @@ pub fn resetTerminal() void {
     }
 }
 
+/// Write buffered stdout & stderr to the terminal.
+/// Must be called before the process exits or the buffered output will be lost.
+/// Bun automatically calls this function in Global.exit().
 pub fn flush() void {
     if (Environment.isNative and source_set) {
         source.buffered_stream.flush() catch {};
@@ -243,7 +246,7 @@ pub fn flush() void {
 }
 
 inline fn printElapsedToWithCtx(elapsed: f64, comptime printerFn: anytype, comptime has_ctx: bool, ctx: anytype) void {
-    switch (elapsed) {
+    switch (@floatToInt(i64, @round(elapsed))) {
         0...1500 => {
             const fmt = "<r><d>[<b>{d:>.2}ms<r><d>]<r>";
             const args = .{elapsed};
@@ -279,12 +282,12 @@ pub fn printElapsedStdout(elapsed: f64) void {
 }
 
 pub fn printStartEnd(start: i128, end: i128) void {
-    const elapsed = @divTrunc(end - start, @as(i128, std.time.ns_per_ms));
+    const elapsed = @divTrunc(@truncate(i64, end - start), @as(i64, std.time.ns_per_ms));
     printElapsed(@intToFloat(f64, elapsed));
 }
 
 pub fn printStartEndStdout(start: i128, end: i128) void {
-    const elapsed = @divTrunc(end - start, @as(i128, std.time.ns_per_ms));
+    const elapsed = @divTrunc(@truncate(i64, end - start), @as(i64, std.time.ns_per_ms));
     printElapsedStdout(@intToFloat(f64, elapsed));
 }
 
@@ -304,14 +307,19 @@ pub fn printErrorable(comptime fmt: string, args: anytype) !void {
     }
 }
 
+/// Print to stdout
+/// This will appear in the terminal, including in production.
+/// Text automatically buffers
 pub fn println(comptime fmt: string, args: anytype) void {
-    if (fmt[fmt.len - 1] != '\n') {
+    if (fmt.len == 0 or fmt[fmt.len - 1] != '\n') {
         return print(fmt ++ "\n", args);
     }
 
     return print(fmt, args);
 }
 
+/// Print to stdout, but only in debug builds.
+/// Text automatically buffers
 pub inline fn debug(comptime fmt: string, args: anytype) void {
     if (comptime Environment.isRelease) return;
     prettyErrorln("\n<d>DEBUG:<r> " ++ fmt, args);
@@ -320,7 +328,7 @@ pub inline fn debug(comptime fmt: string, args: anytype) void {
 
 pub fn _debug(comptime fmt: string, args: anytype) void {
     std.debug.assert(source_set);
-    if (fmt[fmt.len - 1] != '\n') {
+    if (fmt.len == 0 or fmt[fmt.len - 1] != '\n') {
         return print(fmt ++ "\n", args);
     }
 
@@ -350,11 +358,11 @@ pub fn print(comptime fmt: string, args: anytype) void {
 ///   BUN_DEBUG_foo=1
 /// To enable all logs, set the environment variable
 ///   BUN_DEBUG_ALL=1
-const _log_fn = fn (comptime fmt: string, args: anytype) callconv(.Inline) void;
+const _log_fn = fn (comptime fmt: string, args: anytype) void;
 pub fn scoped(comptime tag: @Type(.EnumLiteral), comptime disabled: bool) _log_fn {
     if (comptime !Environment.isDebug) {
         return struct {
-            pub inline fn log(comptime _: string, _: anytype) void {}
+            pub fn log(comptime _: string, _: anytype) void {}
         }.log;
     }
 
@@ -373,7 +381,7 @@ pub fn scoped(comptime tag: @Type(.EnumLiteral), comptime disabled: bool) _log_f
         ///   BUN_DEBUG_foo=1
         /// To enable all logs, set the environment variable
         ///   BUN_DEBUG_ALL=1
-        pub inline fn log(comptime fmt: string, args: anytype) void {
+        pub fn log(comptime fmt: string, args: anytype) void {
             if (!evaluated_disable) {
                 evaluated_disable = true;
                 if (bun.getenvZ("BUN_DEBUG_ALL") != null or
@@ -396,7 +404,7 @@ pub fn scoped(comptime tag: @Type(.EnumLiteral), comptime disabled: bool) _log_f
                 out_set = true;
             }
 
-            if (comptime fmt[fmt.len - 1] != '\n') {
+            if (fmt.len == 0 or fmt[fmt.len - 1] != '\n') {
                 return log(fmt ++ "\n", args);
             }
 
@@ -547,6 +555,8 @@ pub fn pretty(comptime fmt: string, args: anytype) void {
     prettyWithPrinter(fmt, args, print, .stdout);
 }
 
+/// Like Output.println, except it will automatically strip ansi color codes if
+/// the terminal doesn't support them.
 pub fn prettyln(comptime fmt: string, args: anytype) void {
     if (enable_ansi_colors) {
         println(comptime prettyFmt(fmt, true), args);
@@ -556,7 +566,7 @@ pub fn prettyln(comptime fmt: string, args: anytype) void {
 }
 
 pub fn printErrorln(comptime fmt: string, args: anytype) void {
-    if (fmt[fmt.len - 1] != '\n') {
+    if (fmt.len == 0 or fmt[fmt.len - 1] != '\n') {
         return printError(fmt ++ "\n", args);
     }
 
@@ -567,8 +577,10 @@ pub fn prettyError(comptime fmt: string, args: anytype) void {
     prettyWithPrinter(fmt, args, printError, .Error);
 }
 
+/// Print to stderr with ansi color codes automatically stripped out if the
+/// terminal doesn't support them. Text is buffered
 pub fn prettyErrorln(comptime fmt: string, args: anytype) void {
-    if (fmt[fmt.len - 1] != '\n') {
+    if (fmt.len == 0 or fmt[fmt.len - 1] != '\n') {
         return prettyWithPrinter(
             fmt ++ "\n",
             args,
@@ -598,7 +610,7 @@ pub fn prettyWarn(comptime fmt: string, args: anytype) void {
 }
 
 pub fn prettyWarnln(comptime fmt: string, args: anytype) void {
-    if (fmt[fmt.len - 1] != '\n') {
+    if (fmt.len == 0 or fmt[fmt.len - 1] != '\n') {
         return prettyWithPrinter(fmt ++ "\n", args, printError, .Warn);
     }
 
@@ -643,7 +655,7 @@ pub const DebugTimer = struct {
             var _opts = opts;
             _opts.precision = 3;
             std.fmt.formatFloatDecimal(
-                @floatCast(f64, @intToFloat(f128, timer.read()) / std.time.ns_per_ms),
+                @floatCast(f64, @intToFloat(f64, timer.read()) / std.time.ns_per_ms),
                 _opts,
                 writer_,
             ) catch unreachable;

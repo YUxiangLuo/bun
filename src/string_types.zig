@@ -45,7 +45,7 @@ pub const PathString = packed struct {
 
     pub inline fn sliceAssumeZ(this: anytype) stringZ {
         @setRuntimeSafety(false); // "cast causes pointer to be null" is fine here. if it is null, the len will be 0.
-        return @intToPtr([*:0]u8, @intCast(usize, this.ptr))[0..this.len];
+        return @intToPtr([*:0]u8, @intCast(usize, this.ptr))[0..this.len :0];
     }
 
     pub inline fn init(str: string) @This() {
@@ -103,7 +103,7 @@ pub const HashedString = struct {
     pub fn Eql(this: HashedString, comptime Other: type, other: Other) bool {
         switch (comptime Other) {
             HashedString, *HashedString, *const HashedString => {
-                return ((@maximum(this.hash, other.hash) > 0 and this.hash == other.hash) or (this.ptr == other.ptr)) and this.len == other.len;
+                return ((@max(this.hash, other.hash) > 0 and this.hash == other.hash) or (this.ptr == other.ptr)) and this.len == other.len;
             },
             else => {
                 return @as(usize, this.len) == other.len and @truncate(u32, std.hash.Wyhash.hash(0, other[0..other.len])) == this.hash;

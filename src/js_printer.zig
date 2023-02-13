@@ -1,8 +1,8 @@
 const std = @import("std");
 const logger = @import("bun").logger;
-const js_lexer = @import("js_lexer.zig");
+const js_lexer = bun.js_lexer;
 const importRecord = @import("import_record.zig");
-const js_ast = @import("js_ast.zig");
+const js_ast = bun.JSAst;
 const options = @import("options.zig");
 const rename = @import("renamer.zig");
 const runtime = @import("runtime.zig");
@@ -89,6 +89,55 @@ pub fn canPrintWithoutEscape(comptime CodePointType: type, c: CodePointType, com
 }
 
 const indentation_buf = [_]u8{' '} ** 128;
+
+pub fn bestQuoteCharForString(comptime Type: type, str: []const Type, allow_backtick: bool) u8 {
+    var single_cost: usize = 0;
+    var double_cost: usize = 0;
+    var backtick_cost: usize = 0;
+    var char: u8 = 0;
+    var i: usize = 0;
+    while (i < str.len) {
+        switch (str[i]) {
+            '\'' => {
+                single_cost += 1;
+            },
+            '"' => {
+                double_cost += 1;
+            },
+            '`' => {
+                backtick_cost += 1;
+            },
+            '\r', '\n' => {
+                if (allow_backtick) {
+                    return '`';
+                }
+            },
+            '\\' => {
+                i += 1;
+            },
+            '$' => {
+                if (i + 1 < str.len and str[i + 1] == '{') {
+                    backtick_cost += 1;
+                }
+            },
+            else => {},
+        }
+        i += 1;
+    }
+
+    char = '"';
+    if (double_cost > single_cost) {
+        char = '\'';
+
+        if (single_cost > backtick_cost and allow_backtick) {
+            char = '`';
+        }
+    } else if (double_cost > backtick_cost and allow_backtick) {
+        char = '`';
+    }
+
+    return char;
+}
 
 const Whitespacer = struct {
     normal: []const u8,
@@ -179,12 +228,12 @@ pub fn quoteForJSON(text: []const u8, output_: MutableString, comptime ascii_onl
                 try bytes.appendSlice("\\n");
                 i += 1;
             },
-            std.ascii.control_code.CR => {
+            std.ascii.control_code.cr => {
                 try bytes.appendSlice("\\r");
                 i += 1;
             },
             // \v
-            std.ascii.control_code.VT => {
+            std.ascii.control_code.vt => {
                 try bytes.appendSlice("\\v");
                 i += 1;
             },
@@ -326,12 +375,12 @@ pub fn writeJSONString(input: []const u8, comptime Writer: type, writer: Writer,
                 try writer.writeAll("\\n");
                 text = text[1..];
             },
-            std.ascii.control_code.CR => {
+            std.ascii.control_code.cr => {
                 try writer.writeAll("\\r");
                 text = text[1..];
             },
             // \v
-            std.ascii.control_code.VT => {
+            std.ascii.control_code.vt => {
                 try writer.writeAll("\\v");
                 text = text[1..];
             },
@@ -406,7 +455,7 @@ pub const SourceMapHandler = struct {
     ctx: *anyopaque,
     callback: Callback,
 
-    const Callback = (fn (*anyopaque, chunk: SourceMap.Chunk, source: logger.Source) anyerror!void);
+    const Callback = *const fn (*anyopaque, chunk: SourceMap.Chunk, source: logger.Source) anyerror!void;
     pub fn onSourceMapChunk(self: *const @This(), chunk: SourceMap.Chunk, source: logger.Source) anyerror!void {
         try self.callback(self.ctx, chunk, source);
     }
@@ -616,7 +665,7 @@ pub fn NewPrinter(
 
             var remaining: usize = n;
             while (remaining > 0) {
-                const to_write = @minimum(remaining, bytes.len);
+                const to_write = @min(remaining, bytes.len);
                 try self.writeAll(bytes[0..to_write]);
                 remaining -= to_write;
             }
@@ -677,7 +726,7 @@ pub fn NewPrinter(
             var i: usize = p.options.indent * 2;
 
             while (i > 0) {
-                const amt = @minimum(i, indentation_buf.len);
+                const amt = @min(i, indentation_buf.len);
                 p.print(indentation_buf[0..amt]);
                 i -= amt;
             }
@@ -896,11 +945,24 @@ pub fn NewPrinter(
             p.print(keyword);
             p.printSpace();
 
-            for (decls) |*decl, i| {
-                if (i != 0) {
-                    p.print(",");
-                    p.printSpace();
+            if (decls.len == 0) {
+                // "var ;" is invalid syntax
+                // assert we never reach it
+                unreachable;
+            }
+
+            {
+                p.printBinding(decls[0].binding);
+
+                if (decls[0].value) |value| {
+                    p.printWhitespacer(ws(" = "));
+                    p.printExpr(value, .comma, flags);
                 }
+            }
+
+            for (decls[1..]) |*decl| {
+                p.print(",");
+                p.printSpace();
 
                 p.printBinding(decl.binding);
 
@@ -1022,11 +1084,14 @@ pub fn NewPrinter(
             p.print("}");
         }
 
-        pub fn bestQuoteCharForEString(p: *Printer, str: *const E.String, allow_backtick: bool) u8 {
+        pub fn bestQuoteCharForEString(str: *const E.String, allow_backtick: bool) u8 {
+            if (comptime is_json)
+                return '"';
+
             if (str.isUTF8()) {
-                return p.bestQuoteCharForString(str.data, allow_backtick);
+                return bestQuoteCharForString(u8, str.data, allow_backtick);
             } else {
-                return p.bestQuoteCharForString(str.slice16(), allow_backtick);
+                return bestQuoteCharForString(u16, str.slice16(), allow_backtick);
             }
         }
 
@@ -1036,57 +1101,6 @@ pub fn NewPrinter(
             } else {
                 this.print(spacer.normal);
             }
-        }
-
-        pub fn bestQuoteCharForString(_: *Printer, str: anytype, allow_backtick: bool) u8 {
-            if (comptime is_json) return '"';
-
-            var single_cost: usize = 0;
-            var double_cost: usize = 0;
-            var backtick_cost: usize = 0;
-            var char: u8 = 0;
-            var i: usize = 0;
-            while (i < str.len) {
-                switch (str[i]) {
-                    '\'' => {
-                        single_cost += 1;
-                    },
-                    '"' => {
-                        double_cost += 1;
-                    },
-                    '`' => {
-                        backtick_cost += 1;
-                    },
-                    '\r', '\n' => {
-                        if (allow_backtick) {
-                            return '`';
-                        }
-                    },
-                    '\\' => {
-                        i += 1;
-                    },
-                    '$' => {
-                        if (i + 1 < str.len and str[i + 1] == '{') {
-                            backtick_cost += 1;
-                        }
-                    },
-                    else => {},
-                }
-                i += 1;
-            }
-
-            char = '"';
-            if (double_cost > single_cost) {
-                char = '\'';
-
-                if (single_cost > backtick_cost and allow_backtick) {
-                    char = '`';
-                }
-            } else if (double_cost > backtick_cost and allow_backtick) {
-                char = '`';
-            }
-
-            return char;
         }
 
         pub fn printNonNegativeFloat(p: *Printer, float: f64) void {
@@ -1255,13 +1269,13 @@ pub fn NewPrinter(
                         }
                     },
                     // we never print \r un-escaped
-                    std.ascii.control_code.CR => {
+                    std.ascii.control_code.cr => {
                         e.print("\\r");
                     },
                     // \v
-                    std.ascii.control_code.VT => {
+                    std.ascii.control_code.vt => {
                         if (quote == '`') {
-                            e.print(std.ascii.control_code.VT);
+                            e.print(std.ascii.control_code.vt);
                         } else {
                             e.print("\\v");
                         }
@@ -1535,14 +1549,18 @@ pub fn NewPrinter(
         pub inline fn printPure(_: *Printer) void {}
 
         pub fn printQuotedUTF8(p: *Printer, str: string, allow_backtick: bool) void {
-            const quote = p.bestQuoteCharForString(str, allow_backtick);
+            const quote = if (comptime !is_json)
+                bestQuoteCharForString(u8, str, allow_backtick)
+            else
+                '"';
+
             p.print(quote);
             p.print(str);
             p.print(quote);
         }
 
         fn printClauseItem(p: *Printer, item: js_ast.ClauseItem) void {
-            return printClauseItemAs(p, item, .@"import");
+            return printClauseItemAs(p, item, .import);
         }
 
         fn printExportClauseItem(p: *Printer, item: js_ast.ClauseItem) void {
@@ -1552,12 +1570,11 @@ pub fn NewPrinter(
         fn printClauseItemAs(p: *Printer, item: js_ast.ClauseItem, comptime as: @Type(.EnumLiteral)) void {
             const name = p.renamer.nameForSymbol(item.name.ref.?);
 
-            if (comptime as == .@"import") {
+            if (comptime as == .import) {
                 p.printClauseAlias(item.alias);
 
                 if (!strings.eql(name, item.alias)) {
-                    p.print(" as");
-                    p.printSpace();
+                    p.print(" as ");
                     p.addSourceMapping(item.alias_loc);
                     p.printIdentifier(name);
                 }
@@ -1574,8 +1591,7 @@ pub fn NewPrinter(
                 p.printIdentifier(name);
 
                 if (!strings.eql(name, item.alias)) {
-                    p.print(" as");
-                    p.printSpace();
+                    p.print(" as ");
                     p.addSourceMapping(item.alias_loc);
                     p.printClauseAlias(item.alias);
                 }
@@ -1990,7 +2006,7 @@ pub fn NewPrinter(
                     if (e.func.name) |sym| {
                         p.printSpaceBeforeIdentifier();
                         p.addSourceMapping(sym.loc);
-                        p.printSymbol(sym.ref orelse Global.panic("internal error: expected E.Function's name symbol to have a ref\n{s}", .{e.func}));
+                        p.printSymbol(sym.ref orelse Global.panic("internal error: expected E.Function's name symbol to have a ref\n{any}", .{e.func}));
                     }
 
                     p.printFunc(e.func);
@@ -2011,7 +2027,7 @@ pub fn NewPrinter(
                     if (e.class_name) |name| {
                         p.print(" ");
                         p.addSourceMapping(name.loc);
-                        p.printSymbol(name.ref orelse Global.panic("internal error: expected E.Class's name symbol to have a ref\n{s}", .{e}));
+                        p.printSymbol(name.ref orelse Global.panic("internal error: expected E.Class's name symbol to have a ref\n{any}", .{e}));
                     }
                     p.printClass(e.*);
                     if (wrap) {
@@ -2071,22 +2087,30 @@ pub fn NewPrinter(
                     }
                     p.addSourceMapping(expr.loc);
                     p.print("{");
-                    const props = e.properties.slice();
+                    const props = expr.data.e_object.properties.slice();
                     if (props.len > 0) {
                         p.options.indent += @as(usize, @boolToInt(!e.is_single_line));
 
-                        for (props) |property, i| {
-                            if (i != 0) {
-                                p.print(",");
-                            }
+                        if (e.is_single_line) {
+                            p.printSpace();
+                        } else {
+                            p.printNewline();
+                            p.printIndent();
+                        }
+                        p.printProperty(props[0]);
 
-                            if (e.is_single_line) {
-                                p.printSpace();
-                            } else {
-                                p.printNewline();
-                                p.printIndent();
+                        if (props.len > 1) {
+                            for (props[1..]) |property| {
+                                p.print(",");
+
+                                if (e.is_single_line) {
+                                    p.printSpace();
+                                } else {
+                                    p.printNewline();
+                                    p.printIndent();
+                                }
+                                p.printProperty(property);
                             }
-                            p.printProperty(property);
                         }
 
                         if (!e.is_single_line) {
@@ -2122,7 +2146,7 @@ pub fn NewPrinter(
                         return;
                     }
 
-                    const c = p.bestQuoteCharForEString(e, true);
+                    const c = bestQuoteCharForEString(e, true);
 
                     p.print(c);
                     p.printStringContent(e, c);
@@ -2461,7 +2485,7 @@ pub fn NewPrinter(
                     }
                 },
                 else => {
-                    // Global.panic("Unexpected expression of type {s}", .{std.meta.activeTag(expr.data});
+                    // Global.panic("Unexpected expression of type {any}", .{std.meta.activeTag(expr.data});
                 },
             }
         }
@@ -2583,32 +2607,7 @@ pub fn NewPrinter(
                 p.print(" ");
             }
 
-            if (comptime is_bun_platform) {
-                if (e.value.len > 2 and e.usesLookBehindAssertion()) {
-                    p.print("(new globalThis.Bun.OnigurumaRegExp(");
-                    const pattern = e.pattern();
-                    const flags = e.flags();
-                    std.debug.assert(pattern.len > 0);
-                    var buf = bun.default_allocator.alloc(u16, strings.elementLengthUTF8IntoUTF16([]const u8, pattern)) catch unreachable;
-                    defer bun.default_allocator.free(buf);
-                    const buf_len = std.unicode.utf8ToUtf16Le(buf, pattern) catch unreachable;
-                    std.debug.assert(buf_len == buf.len);
-                    const q = p.bestQuoteCharForString(buf, true);
-                    p.print(q);
-                    p.printQuotedUTF16(buf, q);
-                    p.print(q);
-                    if (flags.len > 0) {
-                        p.print(",");
-                        p.printSpace();
-                        p.printQuotedUTF8(flags, true);
-                    }
-                    p.print("))");
-                } else {
-                    p.print(e.value);
-                }
-            } else {
-                p.print(e.value);
-            }
+            p.print(e.value);
 
             // Need a space before the next identifier to avoid it turning into flags
             p.prev_reg_exp_end = p.writer.written;
@@ -2648,44 +2647,48 @@ pub fn NewPrinter(
                     },
                     else => {},
                 }
-            }
 
-            if (item.value) |val| {
-                switch (val.data) {
-                    .e_function => |func| {
-                        if (item.flags.contains(.is_method)) {
-                            if (func.func.flags.contains(.is_async)) {
-                                p.printSpaceBeforeIdentifier();
-                                p.print("async");
+                if (item.value) |val| {
+                    switch (val.data) {
+                        .e_function => |func| {
+                            if (item.flags.contains(.is_method)) {
+                                if (func.func.flags.contains(.is_async)) {
+                                    p.printSpaceBeforeIdentifier();
+                                    p.print("async");
+                                }
+
+                                if (func.func.flags.contains(.is_generator)) {
+                                    p.print("*");
+                                }
+
+                                if (func.func.flags.contains(.is_generator) and func.func.flags.contains(.is_async)) {
+                                    p.printSpace();
+                                }
                             }
+                        },
+                        else => {},
+                    }
 
-                            if (func.func.flags.contains(.is_generator)) {
-                                p.print("*");
-                            }
-
-                            if (func.func.flags.contains(.is_generator) and func.func.flags.contains(.is_async)) {
-                                p.printSpace();
-                            }
-                        }
-                    },
-                    else => {},
-                }
-
-                // If var is declared in a parent scope and var is then written via destructuring pattern, key is null
-                // example:
-                //  var foo = 1;
-                //  if (true) {
-                //      var { foo } = { foo: 2 };
-                //  }
-                if (item.key == null) {
-                    p.printExpr(val, .comma, ExprFlag.None());
-                    return;
+                    // If var is declared in a parent scope and var is then written via destructuring pattern, key is null
+                    // example:
+                    //  var foo = 1;
+                    //  if (true) {
+                    //      var { foo } = { foo: 2 };
+                    //  }
+                    if (item.key == null) {
+                        p.printExpr(val, .comma, ExprFlag.None());
+                        return;
+                    }
                 }
             }
 
             const _key = item.key.?;
 
             if (item.flags.contains(.is_computed)) {
+                if (comptime is_json) {
+                    unreachable;
+                }
+
                 p.print("[");
                 p.printExpr(_key, .comma, ExprFlag.None());
                 p.print("]");
@@ -2714,6 +2717,10 @@ pub fn NewPrinter(
 
             switch (_key.data) {
                 .e_private_identifier => |priv| {
+                    if (comptime is_json) {
+                        unreachable;
+                    }
+
                     p.addSourceMapping(_key.loc);
                     p.printSymbol(priv.ref);
                 },
@@ -2735,7 +2742,10 @@ pub fn NewPrinter(
                             p.print(key.data);
                         } else {
                             allow_shorthand = false;
-                            const quote = p.bestQuoteCharForString(key.data, true);
+                            const quote = if (comptime !is_json)
+                                bestQuoteCharForString(u8, key.data, true)
+                            else
+                                '"';
                             if (quote == '`') {
                                 p.print('[');
                             }
@@ -2812,18 +2822,26 @@ pub fn NewPrinter(
                             }
                         }
                     } else {
-                        const c = p.bestQuoteCharForString(key.slice16(), false);
+                        const c = bestQuoteCharForString(u16, key.slice16(), false);
                         p.print(c);
                         p.printQuotedUTF16(key.slice16(), c);
                         p.print(c);
                     }
                 },
                 else => {
+                    if (comptime is_json) {
+                        unreachable;
+                    }
+
                     p.printExpr(_key, .lowest, ExprFlag.Set{});
                 },
             }
 
             if (item.kind != .normal) {
+                if (comptime is_json) {
+                    bun.unreachablePanic("item.kind must be normal in json, received: {any}", .{item.kind});
+                }
+
                 switch (item.value.?.data) {
                     .e_function => |func| {
                         p.printFunc(func.func);
@@ -2848,6 +2866,10 @@ pub fn NewPrinter(
                 p.print(":");
                 p.printSpace();
                 p.printExpr(val, .comma, ExprFlag.Set{});
+            }
+
+            if (comptime is_json) {
+                std.debug.assert(item.initializer == null);
             }
 
             if (item.initializer) |initial| {
@@ -3015,7 +3037,7 @@ pub fn NewPrinter(
                     p.print("}");
                 },
                 else => {
-                    Global.panic("Unexpected binding of type {s}", .{binding});
+                    Global.panic("Unexpected binding of type {any}", .{binding});
                 },
             }
         }
@@ -3024,6 +3046,7 @@ pub fn NewPrinter(
             if (property.default_value) |default| {
                 p.printSpace();
                 p.print("=");
+                p.printSpace();
                 p.printExpr(default, .comma, ExprFlag.None());
             }
         }
@@ -3043,8 +3066,8 @@ pub fn NewPrinter(
                 .s_function => |s| {
                     p.printIndent();
                     p.printSpaceBeforeIdentifier();
-                    const name = s.func.name orelse Global.panic("Internal error: expected func to have a name ref\n{s}", .{s});
-                    const nameRef = name.ref orelse Global.panic("Internal error: expected func to have a name\n{s}", .{s});
+                    const name = s.func.name orelse Global.panic("Internal error: expected func to have a name ref\n{any}", .{s});
+                    const nameRef = name.ref orelse Global.panic("Internal error: expected func to have a name\n{any}", .{s});
 
                     if (s.func.flags.contains(.is_export)) {
                         if (!rewrite_esm_to_cjs) {
@@ -3203,7 +3226,7 @@ pub fn NewPrinter(
 
                                     if (class.class.class_name) |name| {
                                         p.print("class ");
-                                        p.printSymbol(name.ref orelse Global.panic("Internal error: Expected class to have a name ref\n{s}", .{class}));
+                                        p.printSymbol(name.ref orelse Global.panic("Internal error: Expected class to have a name ref\n{any}", .{class}));
                                     } else {
                                         p.print("class");
                                     }
@@ -3225,7 +3248,7 @@ pub fn NewPrinter(
                                     }
                                 },
                                 else => {
-                                    Global.panic("Internal error: unexpected export default stmt data {s}", .{s});
+                                    Global.panic("Internal error: unexpected export default stmt data {any}", .{s});
                                 },
                             }
                         },
@@ -3513,7 +3536,7 @@ pub fn NewPrinter(
                                 // we need to handle symbol collisions for this
                                 p.print("$eXp0rT_");
                                 var buf: [16]u8 = undefined;
-                                p.print(std.fmt.bufPrint(&buf, "{}", .{std.fmt.fmtSliceHexLower(&@bitCast([4]u8, symbol_counter))}) catch unreachable);
+                                p.print(std.fmt.bufPrint(&buf, "{}", .{bun.fmt.hexIntLower(symbol_counter)}) catch unreachable);
                                 symbol_counter +|= 1;
                             }
 
@@ -3536,7 +3559,7 @@ pub fn NewPrinter(
                                 // we need to handle symbol collisions for this
                                 p.print("$eXp0rT_");
                                 var buf: [16]u8 = undefined;
-                                p.print(std.fmt.bufPrint(&buf, "{}", .{std.fmt.fmtSliceHexLower(&@bitCast([4]u8, symbol_counter))}) catch unreachable);
+                                p.print(std.fmt.bufPrint(&buf, "{}", .{bun.fmt.hexIntLower(symbol_counter)}) catch unreachable);
                                 symbol_counter +|= 1;
                                 p.printWhitespacer(ws(" as "));
                                 p.print(item.alias);
@@ -3684,7 +3707,7 @@ pub fn NewPrinter(
                 },
                 .s_label => |s| {
                     p.printIndent();
-                    p.printSymbol(s.name.ref orelse Global.panic("Internal error: expected label to have a name {s}", .{s}));
+                    p.printSymbol(s.name.ref orelse Global.panic("Internal error: expected label to have a name {any}", .{s}));
                     p.print(":");
                     p.printBody(s.stmt);
                 },
@@ -4121,7 +4144,10 @@ pub fn NewPrinter(
                     p.printSemicolonAfterStatement();
                 },
                 .s_directive => |s| {
-                    const c = p.bestQuoteCharForString(s.value, false);
+                    if (comptime is_json)
+                        unreachable;
+
+                    const c = bestQuoteCharForString(u16, s.value, false);
                     p.printIndent();
                     p.printSpaceBeforeIdentifier();
                     p.print(c);
@@ -4194,7 +4220,10 @@ pub fn NewPrinter(
         }
 
         pub fn printImportRecordPath(p: *Printer, import_record: *const ImportRecord) void {
-            const quote = p.bestQuoteCharForString(import_record.path.text, false);
+            if (comptime is_json)
+                unreachable;
+
+            const quote = bestQuoteCharForString(u8, import_record.path.text, false);
             if (import_record.print_namespace_in_path and import_record.path.namespace.len > 0 and !strings.eqlComptime(import_record.path.namespace, "file")) {
                 p.print(quote);
                 p.print(import_record.path.namespace);
@@ -4325,7 +4354,7 @@ pub fn NewPrinter(
                 return;
             }
 
-            @call(.{ .modifier = .always_inline }, printModuleId, .{ p, p.import_records[import_record_index].module_id });
+            @call(.always_inline, printModuleId, .{ p, p.import_records[import_record_index].module_id });
         }
 
         pub fn printCallModuleID(p: *Printer, module_id: u32) void {
@@ -4414,7 +4443,7 @@ pub fn NewPrinter(
                 // for(;)
                 .s_empty => {},
                 else => {
-                    Global.panic("Internal error: Unexpected stmt in for loop {s}", .{initSt});
+                    Global.panic("Internal error: Unexpected stmt in for loop {any}", .{initSt});
                 },
             }
         }
@@ -4814,11 +4843,11 @@ pub fn NewWriter(
         }
 
         pub inline fn prevChar(writer: *const Self) u8 {
-            return @call(.{ .modifier = .always_inline }, getLastByte, .{&writer.ctx});
+            return @call(.always_inline, getLastByte, .{&writer.ctx});
         }
 
         pub inline fn prevPrevChar(writer: *const Self) u8 {
-            return @call(.{ .modifier = .always_inline }, getLastLastByte, .{&writer.ctx});
+            return @call(.always_inline, getLastLastByte, .{&writer.ctx});
         }
 
         pub fn reserve(writer: *Self, count: u32) anyerror![*]u8 {
@@ -4833,7 +4862,7 @@ pub fn NewWriter(
         pub const Error = error{FormatError};
 
         pub fn writeAll(writer: *Self, bytes: anytype) Error!usize {
-            const written = @maximum(writer.written, 0);
+            const written = @max(writer.written, 0);
             writer.print(@TypeOf(bytes), bytes);
             return @intCast(usize, writer.written) - @intCast(usize, written);
         }
@@ -5018,8 +5047,8 @@ const FileWriterInternal = struct {
 
 pub const BufferWriter = struct {
     buffer: MutableString = undefined,
-    written: []u8 = "",
-    sentinel: [:0]u8 = "",
+    written: []u8 = &[_]u8{},
+    sentinel: [:0]const u8 = "",
     append_null_byte: bool = false,
     append_newline: bool = false,
     approximate_newline_count: usize = 0,
@@ -5219,7 +5248,7 @@ pub fn printAst(
 
     try printer.writer.done();
 
-    return @intCast(usize, @maximum(printer.writer.written, 0));
+    return @intCast(usize, @max(printer.writer.written, 0));
 }
 
 pub fn printJSON(
@@ -5237,6 +5266,9 @@ pub fn printJSON(
     var stmts = &[_]js_ast.Stmt{stmt};
     var parts = &[_]js_ast.Part{.{ .stmts = stmts }};
     const ast = Ast.initTest(parts);
+    var arena = std.heap.ArenaAllocator.init(bun.default_allocator);
+    defer arena.deinit();
+    var allocator = arena.allocator();
     var printer = try PrinterType.init(
         writer,
         &ast,
@@ -5244,7 +5276,7 @@ pub fn printJSON(
         std.mem.zeroes(Symbol.Map),
         .{},
         null,
-        undefined,
+        allocator,
     );
 
     printer.printExpr(expr, Level.lowest, ExprFlag.Set{});
@@ -5253,7 +5285,7 @@ pub fn printJSON(
     }
     try printer.writer.done();
 
-    return @intCast(usize, @maximum(printer.writer.written, 0));
+    return @intCast(usize, @max(printer.writer.written, 0));
 }
 
 pub fn printCommonJS(
@@ -5313,7 +5345,7 @@ pub fn printCommonJS(
 
     try printer.writer.done();
 
-    return @intCast(usize, @maximum(printer.writer.written, 0));
+    return @intCast(usize, @max(printer.writer.written, 0));
 }
 
 pub const WriteResult = struct {
@@ -5338,7 +5370,7 @@ pub fn printCommonJSThreaded(
     comptime getPos: fn (ctx: GetPosType) anyerror!u64,
     end_off_ptr: *u32,
 ) !WriteResult {
-    const PrinterType = NewPrinter(ascii_only, Writer, LinkerType, true, false, true, false, false);
+    const PrinterType = NewPrinter(ascii_only, Writer, LinkerType, true, ascii_only, true, false, false);
     var writer = _writer;
     var printer = try PrinterType.init(
         writer,
@@ -5400,7 +5432,7 @@ pub fn printCommonJSThreaded(
         @atomicStore(u32, end_off_ptr, result.end_off, .SeqCst);
     }
 
-    result.len = @intCast(usize, @maximum(printer.writer.written, 0));
+    result.len = @intCast(usize, @max(printer.writer.written, 0));
 
     return result;
 }

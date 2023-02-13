@@ -2,7 +2,7 @@ const std = @import("std");
 const logger = @import("bun").logger;
 const tables = @import("js_lexer_tables.zig");
 const build_options = @import("build_options");
-const js_ast = @import("js_ast.zig");
+const js_ast = bun.JSAst;
 
 const bun = @import("bun");
 const string = bun.string;
@@ -624,7 +624,7 @@ fn NewLexer_(
 
                         switch (lexer.code_point) {
                             // 0 cannot be in this list because it may be a legacy octal literal
-                            'v', 'f', 't', 'r', 'n', '`', '\'', '"', 0x2028, 0x2029 => {
+                            'v', 'f', 't', 'r', 'n', '`', '\'', '"', '\\', 0x2028, 0x2029 => {
                                 lexer.step();
 
                                 continue :stringLiteral;
@@ -735,7 +735,7 @@ fn NewLexer_(
 
             // Reset string literal
             const base = if (comptime quote == 0) lexer.start else lexer.start + 1;
-            lexer.string_literal_slice = lexer.source.contents[base..@minimum(lexer.source.contents.len, lexer.end - @as(usize, string_literal_details.suffix_len))];
+            lexer.string_literal_slice = lexer.source.contents[base..@min(lexer.source.contents.len, lexer.end - @as(usize, string_literal_details.suffix_len))];
             lexer.string_literal_is_ascii = !string_literal_details.needs_slow_path;
             lexer.string_literal_buffer.shrinkRetainingCapacity(0);
             if (string_literal_details.needs_slow_path) {
@@ -968,7 +968,7 @@ fn NewLexer_(
                     self.addError(self.start, "Expected \"{s}\" but found \"{s}\" (token: {s})", .{
                         keyword,
                         self.raw(),
-                        self.token,
+                        @tagName(self.token),
                     }, true);
                 } else {
                     self.addError(self.start, "Expected \"{s}\" but found \"{s}\"", .{ keyword, self.raw() }, true);
@@ -2139,7 +2139,7 @@ fn NewLexer_(
                         // JSX string literals do not support escaping
                         // They're "pre" escaped
                         switch (lexer.code_point) {
-                            'u', 0x0C, 0, '\t', std.ascii.control_code.VT, 0x08 => {
+                            'u', 0x0C, 0, '\t', std.ascii.control_code.vt, 0x08 => {
                                 needs_decode = true;
                             },
                             else => {},
@@ -3018,8 +3018,8 @@ fn indexOfInterestingCharacterInStringLiteral(text_: []const u8, quote: u8) ?usi
             @bitCast(V1x16, backslash == vec);
 
         if (@reduce(.Max, any_significant) > 0) {
-            const bitmask = @ptrCast(*const u16, &any_significant).*;
-            const first = @ctz(u16, bitmask);
+            const bitmask = @bitCast(u16, any_significant);
+            const first = @ctz(bitmask);
             std.debug.assert(first < strings.ascii_vector_size);
             return first + (@ptrToInt(text.ptr) - @ptrToInt(text_.ptr));
         }

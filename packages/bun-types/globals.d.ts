@@ -69,7 +69,7 @@ interface ArrayConstructor {
     asyncItems: AsyncIterable<T> | Iterable<T> | ArrayLike<T>,
     mapfn?: (value: any, index: number) => any,
     thisArg?: any,
-  ): Array<T>;
+  ): Promise<Array<T>>;
 }
 
 interface Console {
@@ -271,9 +271,17 @@ interface ImportMeta {
   resolveSync(moduleId: string, parent?: string): string;
 
   /**
-   * Resolve a module ID the same as if you imported it
+   * Load a CommonJS module
    *
-   * The `parent` argument is optional, and defaults to the current module's path.
+   * Internally, this is a synchronous version of ESModule's `import()`, with extra code for handling:
+   * - CommonJS modules
+   * - *.node files
+   * - *.json files
+   *
+   * Warning: **This API is not stable** and may change in the future. Use at your
+   * own risk. Usually, you should use `require` instead and Bun's transpiler
+   * will automatically rewrite your code to use `import.meta.require` if
+   * relevant.
    */
   require: NodeJS.Require;
 }
@@ -310,7 +318,9 @@ interface EncodeIntoResult {
 
 interface Process {
   /**
-   * The current version of Bun
+   * A Node.js LTS version
+   *
+   * To see the current Bun version, use {@link Bun.version}
    */
   version: string;
   /**
@@ -334,18 +344,16 @@ interface Process {
   arch: Architecture;
   platform: Platform;
   argv: string[];
-  // execArgv: string[];
+  execArgv: string[];
   env: Bun.Env;
 
   /** Whether you are using Bun */
   isBun: 1; // FIXME: this should actually return a boolean
   /** The current git sha of Bun **/
   revision: string;
-  // execPath: string;
-  // abort(): void;
   chdir(directory: string): void;
   cwd(): string;
-  exit(code?: number): void;
+  exit(code?: number): never;
   getgid(): number;
   setgid(id: number | string): void;
   getuid(): number;
@@ -354,6 +362,41 @@ interface Process {
   stdin: import("stream").Duplex & { isTTY: boolean };
   stdout: import("stream").Writable & { isTTY: boolean };
   stderr: import("stream").Writable & { isTTY: boolean };
+
+  /**
+   * exit the process with a fatal exception, sending SIGABRT
+   */
+  abort(): never;
+
+  /**
+   * Resolved absolute file path to the current Bun executable that is running
+   */
+  readonly execPath: string;
+  /**
+   * The original argv[0] passed to Bun
+   */
+  readonly argv0: string;
+
+  /**
+   * Number of seconds the process has been running
+   *
+   * This uses a high-resolution timer, but divides from nanoseconds to seconds
+   * so there may be some loss of precision.
+   *
+   * For a more precise value, use `performance.timeOrigin` and `performance.now()` instead.
+   */
+  uptime(): number;
+
+  /**
+   * Bun process's file mode creation mask.
+   *
+   * @returns Bun process's file mode creation mask.
+   */
+  umask(mask?: number): number;
+
+  emitWarning(warning: string | Error /*name?: string, ctor?: Function*/): void;
+
+  readonly config: Object;
 }
 
 declare var process: Process;
@@ -371,6 +414,7 @@ interface BlobInterface {
   text(): Promise<string>;
   arrayBuffer(): Promise<ArrayBuffer>;
   json<TJSONReturnType = unknown>(): Promise<TJSONReturnType>;
+  formData(): Promise<FormData>;
 }
 
 type BlobPart = string | Blob | BufferSource | ArrayBuffer;
@@ -458,6 +502,51 @@ type ResponseType =
   | "opaque"
   | "opaqueredirect";
 
+type FormDataEntryValue = Blob | string;
+
+/** Provides a way to easily construct a set of key/value pairs representing
+ * form fields and their values, which can then be easily sent using the
+ * XMLHttpRequest.send() method. It uses the same format a form would use if the
+ * encoding type were set to "multipart/form-data".
+ */
+interface FormData {
+  /**
+   * Appends a new value onto an existing key inside a FormData object, or adds
+   * the key if it does not already exist.
+   *
+   * @param name The name of the field whose data is contained in value.
+   * @param value The field's value.
+   * @param fileName The filename reported to the server.
+   *
+   * ## Upload a file
+   * ```ts
+   * const formData = new FormData();
+   * formData.append("username", "abc123");
+   * formData.append("avatar", Bun.file("avatar.png"), "avatar.png");
+   * await fetch("https://example.com", { method: "POST", body: formData });
+   * ```
+   */
+  append(name: string, value: string | Blob, fileName?: string): void;
+  delete(name: string): void;
+  get(name: string): FormDataEntryValue | null;
+  getAll(name: string): FormDataEntryValue[];
+  has(name: string): boolean;
+  set(name: string, value: string | Blob, fileName?: string): void;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<string>;
+  entries(): IterableIterator<[string, FormDataEntryValue]>;
+  [Symbol.iterator](): IterableIterator<[string, FormDataEntryValue]>;
+  forEach(
+    callback: (value: FormDataEntryValue, key: string, parent: this) => void,
+    thisArg?: any,
+  ): void;
+}
+
+declare var FormData: {
+  prototype: FormData;
+  new (): FormData;
+};
+
 declare class Blob implements BlobInterface {
   /**
    * Create a new [Blob](https://developer.mozilla.org/en-US/docs/Web/API/Blob)
@@ -502,6 +591,20 @@ declare class Blob implements BlobInterface {
    */
   json<TJSONReturnType = unknown>(): Promise<TJSONReturnType>;
 
+  /**
+   * Read the data from the blob as a {@link FormData} object.
+   *
+   * This first decodes the data from UTF-8, then parses it as a
+   * `multipart/form-data` body or a `application/x-www-form-urlencoded` body.
+   *
+   * The `type` property of the blob is used to determine the format of the
+   * body.
+   *
+   * This is a non-standard addition to the `Blob` API, to make it conform more
+   * closely to the `BodyMixin` API.
+   */
+  formData(): Promise<FormData>;
+
   type: string;
   size: number;
 }
@@ -533,7 +636,7 @@ interface ResponseInit {
  */
 declare class Response implements BlobInterface {
   constructor(
-    body?: ReadableStream | BlobPart | BlobPart[] | null,
+    body?: ReadableStream | BlobPart | BlobPart[] | null | FormData,
     options?: ResponseInit,
   );
 
@@ -648,6 +751,18 @@ declare class Response implements BlobInterface {
    */
   blob(): Promise<Blob>;
 
+  /**
+   * Read the data from the Response as a {@link FormData} object.
+   *
+   * This first decodes the data from UTF-8, then parses it as a
+   * `multipart/form-data` body or a `application/x-www-form-urlencoded` body.
+   *
+   * If no `Content-Type` header is present, the promise will be rejected.
+   *
+   * @returns Promise<FormData> - The body of the response as a {@link FormData}.
+   */
+  formData(): Promise<FormData>;
+
   readonly ok: boolean;
   readonly redirected: boolean;
   /**
@@ -709,10 +824,10 @@ type ReferrerPolicy =
   | "strict-origin"
   | "strict-origin-when-cross-origin"
   | "unsafe-url";
-type RequestInfo = Request | string;
+type RequestInfo = Request | string | RequestInit;
 
 type BodyInit = ReadableStream | XMLHttpRequestBodyInit;
-type XMLHttpRequestBodyInit = Blob | BufferSource | string;
+type XMLHttpRequestBodyInit = Blob | BufferSource | string | FormData;
 type ReadableStreamController<T> = ReadableStreamDefaultController<T>;
 type ReadableStreamDefaultReadResult<T> =
   | ReadableStreamDefaultReadValueResult<T>
@@ -789,6 +904,21 @@ interface RequestInit {
    * Enable or disable HTTP request timeout
    */
   timeout?: boolean;
+}
+
+interface FetchRequestInit extends RequestInit {
+  /**
+   * Log the raw HTTP request & response to stdout. This API may be
+   * removed in a future version of Bun without notice.
+   * This is a custom property that is not part of the Fetch API specification.
+   * It exists mostly as a debugging tool
+   */
+  verbose?: boolean;
+  /**
+   * Override http_proxy or HTTPS_PROXY
+   * This is a custom property that is not part of the Fetch API specification.
+   */
+  proxy?: string;
 }
 
 /**
@@ -933,9 +1063,19 @@ declare class Request implements BlobInterface {
 
   /** Copy the Request object into a new Request, including the body */
   clone(): Request;
+
+  /**
+   * Read the body from the Request as a {@link FormData} object.
+   *
+   * This first decodes the data from UTF-8, then parses it as a
+   * `multipart/form-data` body or a `application/x-www-form-urlencoded` body.
+   *
+   * @returns Promise<FormData> - The body of the request as a {@link FormData}.
+   */
+  formData(): Promise<FormData>;
 }
 
-interface Crypto {
+declare interface Crypto {
   readonly subtle: SubtleCrypto;
 
   getRandomValues<T extends BufferSource = BufferSource>(array: T): T;
@@ -951,6 +1091,10 @@ interface Crypto {
    */
   randomUUID(): string;
 }
+declare var Crypto: {
+  prototype: Crypto;
+  new (): Crypto;
+};
 
 declare var crypto: Crypto;
 
@@ -1152,7 +1296,7 @@ interface Blob {
 
 declare var performance: {
   /**
-   * Seconds since Bun.js started
+   * Milliseconds since Bun.js started
    *
    * Uses a high-precision system timer to measure the time elapsed since the
    * Bun.js runtime was initialized. The value is represented as a double
@@ -1161,6 +1305,15 @@ declare var performance: {
    *
    */
   now: () => number;
+
+  /**
+   * The timeOrigin read-only property of the Performance interface returns the
+   * high resolution timestamp that is used as the baseline for
+   * performance-related timestamps.
+   *
+   * @link https://developer.mozilla.org/en-US/docs/Web/API/Performance/timeOrigin
+   */
+  readonly timeOrigin: number;
 };
 
 /**
@@ -1173,6 +1326,11 @@ declare function clearInterval(id?: number): void;
  * @param id timer id
  */
 declare function clearTimeout(id?: number): void;
+/**
+ * Cancel an immediate function call by its immediate ID.
+ * @param id immediate id
+ */
+declare function clearImmediate(id?: number): void;
 // declare function createImageBitmap(image: ImageBitmapSource, options?: ImageBitmapOptions): Promise<ImageBitmap>;
 // declare function createImageBitmap(image: ImageBitmapSource, sx: number, sy: number, sw: number, sh: number, options?: ImageBitmapOptions): Promise<ImageBitmap>;
 /**
@@ -1185,20 +1343,10 @@ declare function clearTimeout(id?: number): void;
  *
  *
  */
+
 declare function fetch(
-  url: string,
-  init?: RequestInit,
-  /**
-   * This is a custom property that is not part of the Fetch API specification.
-   * It exists mostly as a debugging tool
-   */
-  bunOnlyOptions?: {
-    /**
-     * Log the raw HTTP request & response to stdout. This API may be
-     * removed in a future version of Bun without notice.
-     */
-    verbose: boolean;
-  },
+  url: string | URL,
+  init?: FetchRequestInit,
 ): Promise<Response>;
 
 /**
@@ -1212,21 +1360,7 @@ declare function fetch(
  *
  */
 // tslint:disable-next-line:unified-signatures
-declare function fetch(
-  request: Request,
-  init?: RequestInit,
-  /**
-   * This is a custom property that is not part of the Fetch API specification.
-   * It exists mostly as a debugging tool
-   */
-  bunOnlyOptions?: {
-    /**
-     * Log the raw HTTP request & response to stdout. This API may be
-     * removed in a future version of Bun without notice.
-     */
-    verbose: boolean;
-  },
-): Promise<Response>;
+declare function fetch(request: Request, init?: RequestInit): Promise<Response>;
 
 declare function queueMicrotask(callback: (...args: any[]) => void): void;
 /**
@@ -1234,6 +1368,14 @@ declare function queueMicrotask(callback: (...args: any[]) => void): void;
  * @param error Error or string
  */
 declare function reportError(error: any): void;
+/**
+ * Run a function immediately after main event loop is vacant
+ * @param handler function to call
+ */
+declare function setImmediate(
+  handler: TimerHandler,
+  ...arguments: any[]
+): number;
 /**
  * Run a function every `interval` milliseconds
  * @param handler function to call
@@ -1567,6 +1709,27 @@ declare var MessageEvent: {
   new <T>(type: string, eventInitDict?: MessageEventInit<T>): MessageEvent<T>;
 };
 
+interface CustomEventInit<T = any> extends EventInit {
+  detail?: T;
+}
+
+interface CustomEvent<T = any> extends Event {
+  /** Returns any custom data event was created with. Typically used for synthetic events. */
+  readonly detail: T;
+  /** @deprecated */
+  initCustomEvent(
+    type: string,
+    bubbles?: boolean,
+    cancelable?: boolean,
+    detail?: T,
+  ): void;
+}
+
+declare var CustomEvent: {
+  prototype: CustomEvent;
+  new <T>(type: string, eventInitDict?: CustomEventInit<T>): CustomEvent<T>;
+};
+
 /**
  * An implementation of the [WebSocket API](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket)
  */
@@ -1636,6 +1799,25 @@ interface WebSocket extends EventTarget {
 declare var WebSocket: {
   prototype: WebSocket;
   new (url: string | URL, protocols?: string | string[]): WebSocket;
+  new (
+    url: string | URL,
+    options: {
+      /**
+       * An object specifying connection headers
+       *
+       * This is a Bun-specific extension.
+       */
+      headers?: HeadersInit;
+      /**
+       * A string specifying the subprotocols the server is willing to accept.
+       */
+      protocol?: string;
+      /**
+       * A string array specifying the subprotocols the server is willing to accept.
+       */
+      protocols?: string[];
+    },
+  ): WebSocket;
   readonly CLOSED: number;
   readonly CLOSING: number;
   readonly CONNECTING: number;
@@ -1781,7 +1963,7 @@ declare var AbortSignal: {
 
 // type AlgorithmIdentifier = Algorithm | string;
 // type BodyInit = ReadableStream | XMLHttpRequestBodyInit;
-type BufferSource = ArrayBufferView | ArrayBuffer | SharedArrayBuffer;
+type BufferSource = TypedArray | DataView | ArrayBufferLike;
 // type COSEAlgorithmIdentifier = number;
 // type CSSNumberish = number;
 // type CanvasImageSource =
@@ -2208,11 +2390,48 @@ interface ErrnoException extends Error {
   syscall?: string | undefined;
 }
 
+/** An abnormal event (called an exception) which occurs as a result of calling a method or accessing a property of a web API. */
+interface DOMException extends Error {
+  /** @deprecated */
+  readonly code: number;
+  readonly message: string;
+  readonly name: string;
+  readonly ABORT_ERR: number;
+  readonly DATA_CLONE_ERR: number;
+  readonly DOMSTRING_SIZE_ERR: number;
+  readonly HIERARCHY_REQUEST_ERR: number;
+  readonly INDEX_SIZE_ERR: number;
+  readonly INUSE_ATTRIBUTE_ERR: number;
+  readonly INVALID_ACCESS_ERR: number;
+  readonly INVALID_CHARACTER_ERR: number;
+  readonly INVALID_MODIFICATION_ERR: number;
+  readonly INVALID_NODE_TYPE_ERR: number;
+  readonly INVALID_STATE_ERR: number;
+  readonly NAMESPACE_ERR: number;
+  readonly NETWORK_ERR: number;
+  readonly NOT_FOUND_ERR: number;
+  readonly NOT_SUPPORTED_ERR: number;
+  readonly NO_DATA_ALLOWED_ERR: number;
+  readonly NO_MODIFICATION_ALLOWED_ERR: number;
+  readonly QUOTA_EXCEEDED_ERR: number;
+  readonly SECURITY_ERR: number;
+  readonly SYNTAX_ERR: number;
+  readonly TIMEOUT_ERR: number;
+  readonly TYPE_MISMATCH_ERR: number;
+  readonly URL_MISMATCH_ERR: number;
+  readonly VALIDATION_ERR: number;
+  readonly WRONG_DOCUMENT_ERR: number;
+}
+declare var DOMException: {
+  prototype: DOMException;
+  new (message?: string, name?: string): DOMException;
+};
+
 declare function alert(message?: string): void;
 declare function confirm(message?: string): boolean;
 declare function prompt(message?: string, _default?: string): string | null;
 
-/* 
+/*
 
  Web Crypto API
 
@@ -2703,3 +2922,154 @@ interface SharedArrayBuffer {
    */
   grow(size: number): SharedArrayBuffer;
 }
+
+declare namespace WebAssembly {
+  interface CompileError extends Error {}
+
+  var CompileError: {
+    prototype: CompileError;
+    new (message?: string): CompileError;
+    (message?: string): CompileError;
+  };
+
+  interface Global {
+    value: any;
+    valueOf(): any;
+  }
+
+  var Global: {
+    prototype: Global;
+    new (descriptor: GlobalDescriptor, v?: any): Global;
+  };
+
+  interface Instance {
+    readonly exports: Exports;
+  }
+
+  var Instance: {
+    prototype: Instance;
+    new (module: Module, importObject?: Imports): Instance;
+  };
+
+  interface LinkError extends Error {}
+
+  var LinkError: {
+    prototype: LinkError;
+    new (message?: string): LinkError;
+    (message?: string): LinkError;
+  };
+
+  interface Memory {
+    readonly buffer: ArrayBuffer;
+    grow(delta: number): number;
+  }
+
+  var Memory: {
+    prototype: Memory;
+    new (descriptor: MemoryDescriptor): Memory;
+  };
+
+  interface Module {}
+
+  var Module: {
+    prototype: Module;
+    new (bytes: BufferSource): Module;
+    customSections(moduleObject: Module, sectionName: string): ArrayBuffer[];
+    exports(moduleObject: Module): ModuleExportDescriptor[];
+    imports(moduleObject: Module): ModuleImportDescriptor[];
+  };
+
+  interface RuntimeError extends Error {}
+
+  var RuntimeError: {
+    prototype: RuntimeError;
+    new (message?: string): RuntimeError;
+    (message?: string): RuntimeError;
+  };
+
+  interface Table {
+    readonly length: number;
+    get(index: number): any;
+    grow(delta: number, value?: any): number;
+    set(index: number, value?: any): void;
+  }
+
+  var Table: {
+    prototype: Table;
+    new (descriptor: TableDescriptor, value?: any): Table;
+  };
+
+  interface GlobalDescriptor {
+    mutable?: boolean;
+    value: ValueType;
+  }
+
+  interface MemoryDescriptor {
+    initial: number;
+    maximum?: number;
+    shared?: boolean;
+  }
+
+  interface ModuleExportDescriptor {
+    kind: ImportExportKind;
+    name: string;
+  }
+
+  interface ModuleImportDescriptor {
+    kind: ImportExportKind;
+    module: string;
+    name: string;
+  }
+
+  interface TableDescriptor {
+    element: TableKind;
+    initial: number;
+    maximum?: number;
+  }
+
+  interface WebAssemblyInstantiatedSource {
+    instance: Instance;
+    module: Module;
+  }
+
+  type ImportExportKind = "function" | "global" | "memory" | "table";
+  type TableKind = "anyfunc" | "externref";
+  type ValueType =
+    | "anyfunc"
+    | "externref"
+    | "f32"
+    | "f64"
+    | "i32"
+    | "i64"
+    | "v128";
+  type ExportValue = Function | Global | Memory | Table;
+  type Exports = Record<string, ExportValue>;
+  type ImportValue = ExportValue | number;
+  type Imports = Record<string, ModuleImports>;
+  type ModuleImports = Record<string, ImportValue>;
+  function compile(bytes: BufferSource): Promise<Module>;
+  // function compileStreaming(source: Response | PromiseLike<Response>): Promise<Module>;
+  function instantiate(
+    bytes: BufferSource,
+    importObject?: Imports,
+  ): Promise<WebAssemblyInstantiatedSource>;
+  function instantiate(
+    moduleObject: Module,
+    importObject?: Imports,
+  ): Promise<Instance>;
+  // function instantiateStreaming(
+  //   source: Response | PromiseLike<Response>,
+  //   importObject?: Imports,
+  // ): Promise<WebAssemblyInstantiatedSource>;
+  function validate(bytes: BufferSource): boolean;
+}
+
+interface NodeModule {
+  exports: any;
+}
+
+declare var module: NodeModule;
+
+// Same as module.exports
+declare var exports: any;
+declare var global: typeof globalThis;

@@ -11,13 +11,13 @@ const StoredFileDescriptorType = bun.StoredFileDescriptorType;
 const FeatureFlags = bun.FeatureFlags;
 const C = bun.C;
 const std = @import("std");
-const lex = @import("js_lexer.zig");
+const lex = bun.js_lexer;
 const logger = @import("bun").logger;
 const options = @import("options.zig");
-const js_parser = @import("js_parser.zig");
-const json_parser = @import("json_parser.zig");
-const js_printer = @import("js_printer.zig");
-const js_ast = @import("js_ast.zig");
+const js_parser = bun.js_parser;
+const json_parser = bun.JSON;
+const js_printer = bun.js_printer;
+const js_ast = bun.JSAst;
 const linker = @import("linker.zig");
 const Ref = @import("ast/base.zig").Ref;
 const Define = @import("defines.zig").Define;
@@ -399,7 +399,7 @@ pub const Bundler = struct {
         this.resolver.allocator = allocator;
     }
 
-    pub inline fn resolveEntryPoint(bundler: *Bundler, entry_point: string) !_resolver.Result {
+    pub inline fn resolveEntryPoint(bundler: *Bundler, entry_point: string) anyerror!_resolver.Result {
         return bundler.resolver.resolve(bundler.fs.top_level_dir, entry_point, .entry_point) catch |err| {
             const has_dot_slash_form = !strings.hasPrefix(entry_point, "./") and brk: {
                 _ = bundler.resolver.resolve(bundler.fs.top_level_dir, try strings.append(bundler.allocator, "./", entry_point), .entry_point) catch break :brk false;
@@ -454,7 +454,7 @@ pub const Bundler = struct {
             DotEnv.instance = env_loader;
         }
 
-        env_loader.quiet = log.level == .err;
+        env_loader.quiet = !log.level.atLeast(.warn);
 
         // var pool = try allocator.create(ThreadPool);
         // try pool.init(ThreadPool.InitConfig{
@@ -1324,6 +1324,7 @@ pub const Bundler = struct {
         virtual_source: ?*const logger.Source = null,
         replace_exports: runtime.Runtime.Features.ReplaceableExport.Map = .{},
         hoist_bun_plugin: bool = false,
+        inject_jest_globals: bool = false,
     };
 
     pub fn parse(
@@ -1404,6 +1405,17 @@ pub const Bundler = struct {
             .ts,
             .tsx,
             => {
+                // wasm magic number
+                if (source.isWebAssembly()) {
+                    return ParseResult{
+                        .source = source,
+                        .input_fd = input_fd,
+                        .loader = .wasm,
+                        .empty = true,
+                        .ast = js_ast.Ast.empty,
+                    };
+                }
+
                 const platform = bundler.options.platform;
 
                 var jsx = this_parse.jsx;
@@ -1442,6 +1454,7 @@ pub const Bundler = struct {
 
                 opts.features.jsx_optimization_hoist = bundler.options.jsx_optimization_hoist orelse opts.features.jsx_optimization_inline;
                 opts.features.hoist_bun_plugin = this_parse.hoist_bun_plugin;
+                opts.features.inject_jest_globals = this_parse.inject_jest_globals;
                 if (bundler.macro_context == null) {
                     bundler.macro_context = js_ast.Macro.MacroContext.init(bundler);
                 }
@@ -1518,7 +1531,7 @@ pub const Bundler = struct {
             },
             .wasm => {
                 if (bundler.options.platform.isBun()) {
-                    if (source.contents.len < 4 or @bitCast(u32, source.contents[0..4].*) != @bitCast(u32, [4]u8{ 0, 'a', 's', 'm' })) {
+                    if (!source.isWebAssembly()) {
                         bundler.log.addErrorFmt(
                             null,
                             logger.Loc.Empty,
@@ -1538,7 +1551,7 @@ pub const Bundler = struct {
                 }
             },
             .css => {},
-            else => Global.panic("Unsupported loader {s} for path: {s}", .{ loader, source.path.text }),
+            else => Global.panic("Unsupported loader {s} for path: {s}", .{ @tagName(loader), source.path.text }),
         }
 
         return null;
@@ -1836,7 +1849,7 @@ pub const Bundler = struct {
             );
         }
 
-        var final_result = try options.TransformResult.init(try allocator.dupe(u8, bundler.result.outbase), bundler.output_files.toOwnedSlice(), log, allocator);
+        var final_result = try options.TransformResult.init(try allocator.dupe(u8, bundler.result.outbase), try bundler.output_files.toOwnedSlice(), log, allocator);
         final_result.root_dir = bundler.options.output_dir_handle;
         return final_result;
     }

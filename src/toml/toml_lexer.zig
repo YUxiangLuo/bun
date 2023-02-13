@@ -1,6 +1,6 @@
 const std = @import("std");
 const logger = @import("bun").logger;
-const js_ast = @import("../js_ast.zig");
+const js_ast = bun.JSAst;
 
 const bun = @import("bun");
 const string = bun.string;
@@ -768,7 +768,7 @@ pub const Lexer = struct {
                         } else {
                             try lexer.decodeEscapeSequences(start, text, false, @TypeOf(array_list), &array_list);
                         }
-                        lexer.string_literal_slice = array_list.toOwnedSlice();
+                        lexer.string_literal_slice = try array_list.toOwnedSlice();
                     }
 
                     lexer.token = T.t_string_literal;

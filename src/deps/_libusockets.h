@@ -293,7 +293,7 @@ void uws_res_upgrade(int ssl, uws_res_t *res, void *data,
 // Request
 bool uws_req_is_ancient(uws_req_t *res);
 bool uws_req_get_yield(uws_req_t *res);
-void uws_req_set_field(uws_req_t *res, bool yield);
+void uws_req_set_yield(uws_req_t *res, bool yield);
 size_t uws_req_get_url(uws_req_t *res, const char **dest);
 size_t uws_req_get_method(uws_req_t *res, const char **dest);
 size_t uws_req_get_header(uws_req_t *res, const char *lower_case_header,
@@ -329,6 +329,8 @@ bool uws_res_try_end(int ssl, uws_res_t *res, const char *bytes, size_t len,
 
 void uws_res_prepare_for_sendfile(int ssl, uws_res_t *res);
 void uws_res_override_write_offset(int ssl, uws_res_t *res, uintmax_t offset);
+
+void uws_app_close(int ssl, uws_app_t *app);
 
 #ifdef __cplusplus
 }

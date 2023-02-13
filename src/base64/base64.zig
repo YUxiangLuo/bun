@@ -12,7 +12,7 @@ pub fn decode(destination: []u8, source: []const u8) DecodeResult {
         '\n',
         '\r',
         '\t',
-        std.ascii.control_code.VT,
+        std.ascii.control_code.vt,
     }).decode(destination, source, &wrote) catch {
         return .{
             .written = wrote,
@@ -37,28 +37,32 @@ pub fn decodeURLSafe(destination: []u8, source: []const u8) DecodeResult {
 
 pub fn encode(destination: []u8, source: []const u8) usize {
     return zig_base64.standard.Encoder.encode(destination, source).len;
+    
 }
 
-/// Given a source string of length len, this returns the amount of
-/// memory the destination string should have.
-///
-/// remember, this is integer math
-/// 3 bytes turn into 4 chars
-/// ceiling[len / 3] * 4
-///
-///
+pub fn decodeLenUpperBound(len: usize) usize {
+    return zig_base64.standard.Decoder.calcSizeUpperBound(len) catch {
+        //fallback
+        return len / 4 * 3;
+    };
+}
+
 pub fn decodeLen(source: anytype) usize {
-    return (source.len / 4 * 3 + 2);
+    return zig_base64.standard.Decoder.calcSizeForSlice(source) catch {
+        //fallback
+        return source.len / 4 * 3;
+    };
 }
 
 pub fn encodeLen(source: anytype) usize {
-    return (source.len + 2) / 3 * 4;
+    return zig_base64.standard.Encoder.calcSize(source.len);
 }
+
 
 pub const urlsafe = zig_base64.Base64DecoderWithIgnore.init(
     zig_base64.url_safe_alphabet_chars,
     null,
-    "= \t\r\n" ++ [_]u8{ std.ascii.control_code.VT, std.ascii.control_code.FF },
+    "= \t\r\n" ++ [_]u8{ std.ascii.control_code.vt, std.ascii.control_code.ff },
 );
 
 pub const urlsafeEncoder = zig_base64.url_safe_no_pad.Encoder;

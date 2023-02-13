@@ -79,9 +79,9 @@ pub fn stringHashMapFromArrays(comptime t: type, allocator: std.mem.Allocator, k
 }
 
 pub const ExternalModules = struct {
-    node_modules: std.BufSet,
-    abs_paths: std.BufSet,
-    patterns: []const WildcardPattern,
+    node_modules: std.BufSet = undefined,
+    abs_paths: std.BufSet = undefined,
+    patterns: []const WildcardPattern = undefined,
     pub const WildcardPattern = struct {
         prefix: string,
         suffix: string,
@@ -169,7 +169,7 @@ pub const ExternalModules = struct {
             }
         }
 
-        result.patterns = patterns.toOwnedSlice();
+        result.patterns = patterns.toOwnedSlice() catch @panic("TODO");
 
         return result;
     }
@@ -597,6 +597,7 @@ pub const Platform = enum {
                 default_conditions_strings.bun,
                 default_conditions_strings.worker,
                 default_conditions_strings.module,
+                default_conditions_strings.node,
                 default_conditions_strings.browser,
             },
         );
@@ -606,6 +607,7 @@ pub const Platform = enum {
                 default_conditions_strings.bun,
                 default_conditions_strings.worker,
                 default_conditions_strings.module,
+                default_conditions_strings.node,
                 default_conditions_strings.browser,
             },
         );
@@ -633,6 +635,13 @@ pub const Loader = enum(u4) {
     toml,
     wasm,
     napi,
+
+    pub fn canBeRunByBun(this: Loader) bool {
+        return switch (this) {
+            .jsx, .js, .ts, .tsx, .json, .wasm => true,
+            else => false,
+        };
+    }
 
     pub const Map = std.EnumArray(Loader, string);
     pub const stdin_name: Map = brk: {
@@ -667,7 +676,7 @@ pub const Loader = enum(u4) {
         if (zig_str.len == 0) return null;
 
         return fromString(zig_str.slice()) orelse {
-            JSC.throwInvalidArguments("invalid loader – must be js, jsx, tsx, ts, css, file, toml, wasm, or json", .{}, global, exception);
+            JSC.throwInvalidArguments("invalid loader - must be js, jsx, tsx, ts, css, file, toml, wasm, or json", .{}, global, exception);
             return null;
         };
     }
@@ -1160,7 +1169,7 @@ pub const SourceMapOption = enum {
     pub fn toAPI(source_map: ?SourceMapOption) Api.SourceMapMode {
         return switch (source_map orelse .none) {
             .external => .external,
-            .@"inline" => .@"inline_into_file",
+            .@"inline" => .inline_into_file,
             else => ._none,
         };
     }
@@ -1168,7 +1177,7 @@ pub const SourceMapOption = enum {
     pub const map = ComptimeStringMap(SourceMapOption, .{
         .{ "none", .none },
         .{ "inline", .@"inline" },
-        .{ "external", .@"external" },
+        .{ "external", .external },
     });
 };
 
@@ -1416,7 +1425,7 @@ pub const BundleOptions = struct {
                 opts.node_modules_bundle = node_mods;
                 const pretty_path = fs.relativeTo(transform.node_modules_bundle_path.?);
                 opts.node_modules_bundle_url = try std.fmt.allocPrint(allocator, "{s}{s}", .{
-                    opts.origin,
+                    opts.origin.href,
                     pretty_path,
                 });
             } else if (transform.node_modules_bundle_path) |bundle_path| {
@@ -1547,7 +1556,7 @@ pub const BundleOptions = struct {
             if (!disabled_static) {
                 var _dirs = [_]string{chosen_dir};
                 opts.routes.static_dir = try fs.absAlloc(allocator, &_dirs);
-                opts.routes.static_dir_handle = std.fs.openDirAbsolute(opts.routes.static_dir, .{ .iterate = true }) catch |err| brk: {
+                const static_dir = std.fs.openIterableDirAbsolute(opts.routes.static_dir, .{}) catch |err| brk: {
                     switch (err) {
                         error.FileNotFound => {
                             opts.routes.static_dir_enabled = false;
@@ -1570,6 +1579,9 @@ pub const BundleOptions = struct {
 
                     break :brk null;
                 };
+                if (static_dir) |handle| {
+                    opts.routes.static_dir_handle = handle.dir;
+                }
                 opts.routes.static_dir_enabled = opts.routes.static_dir_handle != null;
             }
 
@@ -1669,13 +1681,13 @@ pub const BundleOptions = struct {
 };
 
 pub fn openOutputDir(output_dir: string) !std.fs.Dir {
-    return std.fs.cwd().openDir(output_dir, std.fs.Dir.OpenDirOptions{ .iterate = true }) catch brk: {
+    return std.fs.cwd().openDir(output_dir, .{}) catch brk: {
         std.fs.cwd().makeDir(output_dir) catch |err| {
             Output.printErrorln("error: Unable to mkdir \"{s}\": \"{s}\"", .{ output_dir, @errorName(err) });
             Global.crash();
         };
 
-        var handle = std.fs.cwd().openDir(output_dir, std.fs.Dir.OpenDirOptions{ .iterate = true }) catch |err2| {
+        var handle = std.fs.cwd().openDir(output_dir, .{}) catch |err2| {
             Output.printErrorln("error: Unable to open \"{s}\": \"{s}\"", .{ output_dir, @errorName(err2) });
             Global.crash();
         };
@@ -1875,8 +1887,8 @@ pub const TransformResult = struct {
         return TransformResult{
             .outbase = outbase,
             .output_files = output_files,
-            .errors = errors.toOwnedSlice(),
-            .warnings = warnings.toOwnedSlice(),
+            .errors = try errors.toOwnedSlice(),
+            .warnings = try warnings.toOwnedSlice(),
         };
     }
 };
@@ -2080,7 +2092,7 @@ pub const Framework = struct {
     from_bundle: bool = false,
 
     resolved_dir: string = "",
-    override_modules: Api.StringMap = Api.StringMap{},
+    override_modules: Api.StringMap,
     override_modules_hashes: []u64 = &[_]u64{},
 
     client_css_in_js: Api.CssInJsBehavior = .auto_onimportcss,
@@ -2199,7 +2211,7 @@ pub const RouteConfig = struct {
     // I think it's fine to hardcode as .json for now, but if I personally were writing a framework
     // I would consider using a custom binary format to minimize request size
     // maybe like CBOR
-    extensions: []const string = &[_][]const string{},
+    extensions: []const string = &[_]string{},
     routes_enabled: bool = false,
 
     static_dir: string = "",

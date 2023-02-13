@@ -1,8 +1,8 @@
 const std = @import("std");
-const js_ast = @import("./js_ast.zig");
+const js_ast = bun.JSAst;
 const logger = @import("bun").logger;
-const js_lexer = @import("js_lexer.zig");
-const json_parser = @import("json_parser.zig");
+const js_lexer = bun.js_lexer;
+const json_parser = bun.JSON;
 const fs = @import("fs.zig");
 const bun = @import("bun");
 const string = bun.string;
@@ -245,7 +245,7 @@ pub const Define = struct {
                         // TODO: do we need to allocate this?
                         .parts = parts,
                     });
-                    try define.dots.put(tail, list.toOwnedSlice());
+                    try define.dots.put(tail, try list.toOwnedSlice());
                 }
             } else {
 
@@ -283,7 +283,7 @@ pub const Define = struct {
                         .data = value_define,
                     });
 
-                    define.dots.putAssumeCapacity(key, list.toOwnedSlice());
+                    define.dots.putAssumeCapacity(key, try list.toOwnedSlice());
                 } else {
                     var list = try std.ArrayList(DotDefine).initCapacity(allocator, 1);
                     list.appendAssumeCapacity(DotDefine{
@@ -291,7 +291,7 @@ pub const Define = struct {
                         .data = value_define,
                     });
 
-                    define.dots.putAssumeCapacity(key, list.toOwnedSlice());
+                    define.dots.putAssumeCapacity(key, try list.toOwnedSlice());
                 }
             }
         }

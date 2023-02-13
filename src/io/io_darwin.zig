@@ -16,7 +16,7 @@ const os = struct {
     pub const ESPIPE = 29;
 };
 
-const SystemErrno = @import("../darwin_c.zig").SystemErrno;
+const SystemErrno = @import("bun").C.SystemErrno;
 pub const Errno = error{
     EPERM,
     ENOENT,
@@ -259,14 +259,14 @@ const fd_t = os.fd_t;
 const mem = std.mem;
 const assert = std.debug.assert;
 const c = std.c;
-const bun = @import("bun");
+const bun = @import("root").bun;
 pub const darwin = struct {
     pub usingnamespace os.darwin;
     pub extern "c" fn @"recvfrom$NOCANCEL"(sockfd: c.fd_t, noalias buf: *anyopaque, len: usize, flags: u32, noalias src_addr: ?*c.sockaddr, noalias addrlen: ?*c.socklen_t) isize;
     pub extern "c" fn @"sendto$NOCANCEL"(sockfd: c.fd_t, buf: *const anyopaque, len: usize, flags: u32, dest_addr: ?*const c.sockaddr, addrlen: c.socklen_t) isize;
     pub extern "c" fn @"fcntl$NOCANCEL"(fd: c.fd_t, cmd: c_int, ...) c_int;
-    pub extern "c" fn @"sendmsg$NOCANCEL"(sockfd: c.fd_t, msg: *const std.x.os.Socket.Message, flags: c_int) isize;
-    pub extern "c" fn @"recvmsg$NOCANCEL"(sockfd: c.fd_t, msg: *std.x.os.Socket.Message, flags: c_int) isize;
+    // pub extern "c" fn @"sendmsg$NOCANCEL"(sockfd: c.fd_t, msg: *const std.x.os.Socket.Message, flags: c_int) isize;
+    // pub extern "c" fn @"recvmsg$NOCANCEL"(sockfd: c.fd_t, msg: *std.x.os.Socket.Message, flags: c_int) isize;
     pub extern "c" fn @"connect$NOCANCEL"(sockfd: c.fd_t, sock_addr: *const c.sockaddr, addrlen: c.socklen_t) c_int;
     pub extern "c" fn @"accept$NOCANCEL"(sockfd: c.fd_t, noalias addr: ?*c.sockaddr, noalias addrlen: ?*c.socklen_t) c_int;
     pub extern "c" fn @"accept4$NOCANCEL"(sockfd: c.fd_t, noalias addr: ?*c.sockaddr, noalias addrlen: ?*c.socklen_t, flags: c_uint) c_int;
@@ -508,6 +508,8 @@ pub const Waker = struct {
     const zeroed = std.mem.zeroes([16]Kevent64);
 
     pub fn wake(this: *Waker) !void {
+        bun.JSC.markBinding(@src());
+
         if (io_darwin_schedule_wakeup(this.machport)) {
             this.has_pending_wake = false;
             return;
@@ -516,6 +518,7 @@ pub const Waker = struct {
     }
 
     pub fn wait(this: Waker) !usize {
+        bun.JSC.markBinding(@src());
         var events = zeroed;
 
         const count = std.os.system.kevent64(
@@ -551,6 +554,7 @@ pub const Waker = struct {
     }
 
     pub fn initWithFileDescriptor(allocator: std.mem.Allocator, kq: i32) !Waker {
+        bun.JSC.markBinding(@src());
         assert(kq > -1);
         var machport_buf = try allocator.alloc(u8, 1024);
         const machport = io_darwin_create_machport(
@@ -573,6 +577,7 @@ pub const UserFilterWaker = struct {
     ident: u64 = undefined,
 
     pub fn wake(this: UserFilterWaker) !void {
+        bun.JSC.markBinding(@src());
         var events = zeroed;
         events[0].ident = this.ident;
         events[0].filter = c.EVFILT_USER;
@@ -860,7 +865,7 @@ fn flush_timeouts(self: *IO) ?u64 {
 
         const timeout_ns = expires - now;
         if (min_timeout) |min_ns| {
-            min_timeout = @minimum(min_ns, timeout_ns);
+            min_timeout = @min(min_ns, timeout_ns);
         } else {
             min_timeout = timeout_ns;
         }
@@ -872,7 +877,7 @@ fn flush_timeouts(self: *IO) ?u64 {
 pub const Completion = struct {
     next: ?*Completion,
     context: ?*anyopaque,
-    callback: fn (*IO, *Completion) void,
+    callback: *const fn (*IO, *Completion) void,
     operation: Operation,
 };
 
@@ -1021,7 +1026,7 @@ pub fn event(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: void,
@@ -1047,7 +1052,7 @@ pub fn nextTick(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: void,
@@ -1070,7 +1075,7 @@ pub fn accept(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: AcceptError!os.socket_t,
@@ -1125,7 +1130,7 @@ pub fn close(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: CloseError!void,
@@ -1167,7 +1172,7 @@ pub fn connect(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: IO.ConnectError!void,
@@ -1249,7 +1254,7 @@ pub fn fsync(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: FsyncError!void,
@@ -1279,7 +1284,7 @@ pub fn open(
     _: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: OpenError!fd_t,
@@ -1314,7 +1319,7 @@ pub fn read(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: ReadError!usize,
@@ -1378,7 +1383,7 @@ pub fn recv(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: RecvError!usize,
@@ -1435,7 +1440,7 @@ pub fn send(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: SendError!usize,
@@ -1491,7 +1496,7 @@ pub fn timeout(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: TimeoutError!void,
@@ -1519,7 +1524,7 @@ fn timeoutInternal(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: TimeoutError!void,
@@ -1550,7 +1555,7 @@ pub fn write(
     self: *IO,
     comptime Context: type,
     context: Context,
-    comptime callback: fn (
+    comptime callback: *const fn (
         context: Context,
         completion: *Completion,
         result: WriteError!usize,
@@ -1605,7 +1610,7 @@ fn buffer_limit(buffer_len: usize) usize {
         .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
         else => std.math.maxInt(isize),
     };
-    return @minimum(limit, buffer_len);
+    return @min(limit, buffer_len);
 }
 
 pub var global: IO = undefined;

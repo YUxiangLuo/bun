@@ -10,15 +10,15 @@ const default_allocator = bun.default_allocator;
 const constStrToU8 = bun.constStrToU8;
 const FeatureFlags = bun.FeatureFlags;
 const C = bun.C;
-
+const root = @import("root");
 const std = @import("std");
-const lex = @import("js_lexer.zig");
+const lex = bun.js_lexer;
 const logger = @import("bun").logger;
 const options = @import("options.zig");
-const js_parser = @import("js_parser.zig");
-const json_parser = @import("json_parser.zig");
-const js_printer = @import("js_printer.zig");
-const js_ast = @import("js_ast.zig");
+const js_parser = bun.js_parser;
+const json_parser = bun.JSON;
+const js_printer = bun.js_printer;
+const js_ast = bun.JSAst;
 const linker = @import("linker.zig");
 
 const sync = @import("./sync.zig");
@@ -28,7 +28,7 @@ const configureTransformOptionsForBun = @import("./bun.js/config.zig").configure
 const clap = @import("bun").clap;
 const BunJS = @import("./bun_js.zig");
 const Install = @import("./install/install.zig");
-const bundler = @import("bundler.zig");
+const bundler = bun.bundler;
 const DotEnv = @import("./env_loader.zig");
 
 const fs = @import("fs.zig");
@@ -53,6 +53,7 @@ const RunCommand = @import("./cli/run_command.zig").RunCommand;
 const ShellCompletions = @import("./cli/shell_completions.zig");
 const TestCommand = @import("./cli/test_command.zig").TestCommand;
 const UpgradeCommand = @import("./cli/upgrade_command.zig").UpgradeCommand;
+const BunxCommand = @import("./cli/bunx_command.zig").BunxCommand;
 
 const MacroMap = @import("./resolver/package_json.zig").MacroMap;
 
@@ -163,6 +164,7 @@ pub const Arguments = struct {
 
     const public_params = [_]ParamType{
         clap.parseParam("--use <STR>                       Choose a framework, e.g. \"--use next\". It checks first for a package named \"bun-framework-packagename\" and then \"packagename\".") catch unreachable,
+        clap.parseParam("-b, --bun                         Force a script or package to use Bun.js instead of Node.js (via symlinking node)") catch unreachable,
         clap.parseParam("--bunfile <STR>                   Use a .bun file (default: node_modules.bun)") catch unreachable,
         clap.parseParam("--server-bunfile <STR>            Use a .server.bun file (default: node_modules.server.bun)") catch unreachable,
         clap.parseParam("--cwd <STR>                       Absolute path to resolve files & entry points from. This just changes the process' cwd.") catch unreachable,
@@ -178,7 +180,7 @@ pub const Arguments = struct {
         clap.parseParam("--main-fields <STR>...            Main fields to lookup in package.json. Defaults to --platform dependent") catch unreachable,
         clap.parseParam("--no-summary                     Don't print a summary (when generating .bun") catch unreachable,
         clap.parseParam("-v, --version                    Print version and exit") catch unreachable,
-        clap.parseParam("--platform <STR>                  \"browser\" or \"node\". Defaults to \"browser\"") catch unreachable,
+        clap.parseParam("--platform <STR>                  \"bun\" or \"browser\" or \"node\", used when building or bundling") catch unreachable,
         // clap.parseParam("--production                      [not implemented] generate production code") catch unreachable,
         clap.parseParam("--public-dir <STR>                Top-level directory for .html files, fonts or anything external. Defaults to \"<cwd>/public\", to match create-react-app and Next.js") catch unreachable,
         clap.parseParam("--tsconfig-override <STR>         Load tsconfig from path instead of cwd/tsconfig.json") catch unreachable,
@@ -256,9 +258,7 @@ pub const Arguments = struct {
     fn getHomeConfigPath(buf: *[bun.MAX_PATH_BYTES]u8) ?[:0]const u8 {
         if (bun.getenvZ("XDG_CONFIG_HOME") orelse bun.getenvZ("HOME")) |data_dir| {
             var paths = [_]string{".bunfig.toml"};
-            var outbuf = resolve_path.joinAbsStringBuf(data_dir, buf, &paths, .auto);
-            buf[outbuf.len] = 0;
-            return std.meta.assumeSentinel(outbuf, 0);
+            return resolve_path.joinAbsStringBufZ(data_dir, buf, &paths, .auto);
         }
 
         return null;
@@ -350,8 +350,14 @@ pub const Arguments = struct {
 
         var cwd: []u8 = undefined;
         if (args.option("--cwd")) |cwd_| {
-            var cwd_paths = [_]string{cwd_};
-            cwd = try std.fs.path.resolve(allocator, &cwd_paths);
+            cwd = brk: {
+                var outbuf: [bun.MAX_PATH_BYTES]u8 = undefined;
+                const out = std.os.realpath(cwd_, &outbuf) catch |err| {
+                    Output.prettyErrorln("error resolving --cwd: {s}", .{@errorName(err)});
+                    Global.exit(1);
+                };
+                break :brk try allocator.dupe(u8, out);
+            };
         } else {
             cwd = try std.process.getCwdAlloc(allocator);
         }
@@ -618,7 +624,11 @@ pub const Arguments = struct {
                 PlatformMatcher.case("bun") => Api.Platform.bun,
                 else => invalidPlatform(&diag, _platform),
             };
+
+            ctx.debug.run_in_bun = opts.platform.? == .bun;
         }
+
+        ctx.debug.run_in_bun = args.flag("--bun") or ctx.debug.run_in_bun;
 
         if (jsx_factory != null or
             jsx_fragment != null or
@@ -712,29 +722,33 @@ pub const HelpCommand = struct {
     };
 
     pub const packages_to_add_filler = [_]string{
-        "astro",
+        "elysia",
+        "@shumai/shumai",
+        "hono",
         "react",
-        "next@^12",
-        "tailwindcss",
-        "wrangler",
-        "@compiled/react",
+        "lyra",
         "@remix-run/dev",
-        "contentlayer",
+        "@evan/duckdb",
+        "@zarfjs/zarf",
     };
 
     pub fn printWithReason(comptime reason: Reason) void {
+        // the spacing between commands here is intentional
         const fmt =
-            \\> <r> <b><green>dev     <r><d>  ./a.ts ./b.jsx<r>        Start a bun Dev Server
-            \\> <r> <b><magenta>bun     <r><d>  ./a.ts ./b.jsx<r>        Bundle dependencies of input files into a <r><magenta>.bun<r>
+            \\> <r> <b><magenta>run     <r><d>  ./my-script.ts        <r>Run JavaScript with bun, a package.json script, or a bin<r>
+            \\> <r> <b><green>x     <r>    <d>bun-repl        <r>      Install and execute a package bin <d>(bunx)<r>
             \\
             \\> <r> <b><cyan>init<r>                            Start an empty Bun project from a blank template<r>
             \\> <r> <b><cyan>create    <r><d>next ./app<r>            Create a new project from a template <d>(bun c)<r>
-            \\> <r> <b><magenta>run     <r><d>  test        <r>          Run JavaScript with bun, a package.json script, or a bin<r>
             \\> <r> <b><green>install<r>                         Install dependencies for a package.json <d>(bun i)<r>
             \\> <r> <b><blue>add     <r><d>  {s:<16}<r>      Add a dependency to package.json <d>(bun a)<r>
             \\> <r> <b><blue>link <r>                           Link an npm package globally<r>
             \\> <r> remove  <r><d>  {s:<16}<r>      Remove a dependency from package.json <d>(bun rm)<r>
             \\> <r> unlink  <r>                        Globally unlink an npm package
+            \\> <r> pm  <r>                            More commands for managing packages
+            \\
+            \\> <r> <b><green>dev     <r><d>  ./a.ts ./b.jsx<r>        Start a bun (frontend) Dev Server
+            \\> <r> <b><magenta>bun     <r><d>  ./a.ts ./b.jsx<r>        Bundle dependencies of input files into a <r><magenta>.bun<r>
             \\
             \\> <r> <b><blue>upgrade <r>                        Get the latest version of bun
             \\> <r> <b><d>completions<r>                     Install shell completions for tab-completion
@@ -743,7 +757,8 @@ pub const HelpCommand = struct {
             \\
         ;
 
-        var rand = std.rand.DefaultPrng.init(@intCast(u64, @maximum(std.time.milliTimestamp(), 0))).random();
+        var rand_state = std.rand.DefaultPrng.init(@intCast(u64, @max(std.time.milliTimestamp(), 0)));
+        const rand = rand_state.random();
         const package_add_i = rand.uintAtMost(usize, packages_to_add_filler.len - 1);
         const package_remove_i = rand.uintAtMost(usize, packages_to_remove_filler.len - 1);
 
@@ -815,11 +830,14 @@ pub const Command = struct {
         hot_reload: bool = false,
         global_cache: options.GlobalCache = .auto,
         offline_mode_setting: ?Bunfig.OfflineMode = null,
+        run_in_bun: bool = false,
 
         // technical debt
         macros: ?MacroMap = null,
         editor: string = "",
         package_bundle_map: bun.StringArrayHashMapUnmanaged(options.BundlePackage) = bun.StringArrayHashMapUnmanaged(options.BundlePackage){},
+
+        test_directory: []const u8 = "",
     };
 
     pub const Context = struct {
@@ -877,10 +895,16 @@ pub const Command = struct {
     pub fn which() Tag {
         var args_iter = ArgsIterator{ .buf = std.os.argv };
         // first one is the executable name
-        const skipped = args_iter.skip();
 
-        if (!skipped) {
-            return .HelpCommand;
+        const argv0 = args_iter.next() orelse return .HelpCommand;
+
+        // symlink is argv[0]
+        if (strings.endsWithComptime(argv0, "bunx"))
+            return .BunxCommand;
+
+        if (comptime Environment.isDebug) {
+            if (strings.endsWithComptime(argv0, "bunx-debug"))
+                return .BunxCommand;
         }
 
         var next_arg = ((args_iter.next()) orelse return .AutoCommand);
@@ -900,6 +924,7 @@ pub const Command = struct {
             RootCommandMatcher.case("getcompletes") => .GetCompletionsCommand,
             RootCommandMatcher.case("link") => .LinkCommand,
             RootCommandMatcher.case("unlink") => .UnlinkCommand,
+            RootCommandMatcher.case("x") => .BunxCommand,
 
             RootCommandMatcher.case("i"), RootCommandMatcher.case("install") => brk: {
                 for (args_iter.buf) |arg| {
@@ -942,6 +967,8 @@ pub const Command = struct {
         "bun",
         "upgrade",
         "discord",
+        "pm",
+        "x",
     };
 
     const reject_list = default_completions_list ++ [_]string{
@@ -990,6 +1017,12 @@ pub const Command = struct {
                 const ctx = try Command.Context.create(allocator, log, .AddCommand);
 
                 try AddCommand.exec(ctx);
+                return;
+            },
+            .BunxCommand => {
+                const ctx = try Command.Context.create(allocator, log, .BunxCommand);
+
+                try BunxCommand.exec(ctx);
                 return;
             },
             .RemoveCommand => {
@@ -1207,12 +1240,21 @@ pub const Command = struct {
                     break :brk null;
                 };
 
+                const force_using_bun = ctx.debug.run_in_bun;
+                var did_check = false;
                 if (default_loader) |loader| {
-                    if (loader.isJavaScriptLike()) {
+                    if (loader.canBeRunByBun()) {
                         was_js_like = true;
                         if (maybeOpenWithBunJS(&ctx)) {
                             return;
                         }
+                        did_check = true;
+                    }
+                }
+
+                if (force_using_bun and !did_check) {
+                    if (maybeOpenWithBunJS(&ctx)) {
+                        return;
                     }
                 }
 
@@ -1221,16 +1263,20 @@ pub const Command = struct {
                         return;
                     }
 
+                    Output.prettyErrorln("<r><red>error<r><d>:<r> script not found \"<b>{s}<r>\"", .{
+                        ctx.positionals[0],
+                    });
+
                     Global.exit(1);
                 }
 
                 if (was_js_like) {
-                    Output.prettyErrorln("<r><red>error<r>: Module not found \"<b>{s}<r>\"", .{
+                    Output.prettyErrorln("<r><red>error<r><d>:<r> module not found \"<b>{s}<r>\"", .{
                         ctx.positionals[0],
                     });
                     Global.exit(1);
                 } else if (ctx.positionals.len > 0) {
-                    Output.prettyErrorln("<r><red>error<r>: File not found \"<b>{s}<r>\"", .{
+                    Output.prettyErrorln("<r><red>error<r><d>:<r> file not found \"<b>{s}<r>\"", .{
                         ctx.positionals[0],
                     });
                     Global.exit(1);
@@ -1243,6 +1289,9 @@ pub const Command = struct {
     }
 
     fn maybeOpenWithBunJS(ctx: *const Command.Context) bool {
+        if (ctx.args.entry_points.len == 0)
+            return false;
+
         const script_name_to_search = ctx.args.entry_points[0];
 
         var file_path = script_name_to_search;
@@ -1287,7 +1336,7 @@ pub const Command = struct {
         Global.configureAllocator(.{ .long_running = true });
 
         // the case where this doesn't work is if the script name on disk doesn't end with a known JS-like file extension
-        var absolute_script_path = std.os.getFdPath(file.handle, &script_name_buf) catch return false;
+        var absolute_script_path = bun.getFdPath(file.handle, &script_name_buf) catch return false;
         BunJS.Run.boot(
             ctx.*,
             file,
@@ -1309,9 +1358,11 @@ pub const Command = struct {
     }
 
     pub const Tag = enum {
+        AddCommand,
         AutoCommand,
         BuildCommand,
         BunCommand,
+        BunxCommand,
         CreateCommand,
         DevCommand,
         DiscordCommand,
@@ -1319,15 +1370,14 @@ pub const Command = struct {
         HelpCommand,
         InitCommand,
         InstallCommand,
-        AddCommand,
-        RemoveCommand,
         InstallCompletionsCommand,
-        RunCommand,
-        UpgradeCommand,
-        PackageManagerCommand,
-        TestCommand,
         LinkCommand,
+        PackageManagerCommand,
+        RemoveCommand,
+        RunCommand,
+        TestCommand,
         UnlinkCommand,
+        UpgradeCommand,
 
         pub fn params(comptime cmd: Tag) []const Arguments.ParamType {
             return &comptime switch (cmd) {
@@ -1338,14 +1388,14 @@ pub const Command = struct {
 
         pub fn readGlobalConfig(this: Tag) bool {
             return switch (this) {
-                .PackageManagerCommand, .InstallCommand, .AddCommand, .RemoveCommand => true,
+                .BunxCommand, .PackageManagerCommand, .InstallCommand, .AddCommand, .RemoveCommand => true,
                 else => false,
             };
         }
 
         pub fn isNPMRelated(this: Tag) bool {
             return switch (this) {
-                .LinkCommand, .UnlinkCommand, .PackageManagerCommand, .InstallCommand, .AddCommand, .RemoveCommand => true,
+                .BunxCommand, .LinkCommand, .UnlinkCommand, .PackageManagerCommand, .InstallCommand, .AddCommand, .RemoveCommand => true,
                 else => false,
             };
         }
@@ -1366,6 +1416,7 @@ pub const Command = struct {
             cares.set(.RemoveCommand, true);
             cares.set(.LinkCommand, true);
             cares.set(.UnlinkCommand, true);
+            cares.set(.BunxCommand, true);
             break :brk cares;
         };
         pub const always_loads_config: std.EnumArray(Tag, bool) = std.EnumArray(Tag, bool).initDefault(false, .{
@@ -1377,6 +1428,7 @@ pub const Command = struct {
             .AddCommand = true,
             .RemoveCommand = true,
             .PackageManagerCommand = true,
+            .BunxCommand = true,
         });
 
         pub const uses_global_options: std.EnumArray(Tag, bool) = std.EnumArray(Tag, bool).initDefault(true, .{
@@ -1387,6 +1439,7 @@ pub const Command = struct {
             .PackageManagerCommand = false,
             .LinkCommand = false,
             .UnlinkCommand = false,
+            .BunxCommand = false,
         });
     };
 };

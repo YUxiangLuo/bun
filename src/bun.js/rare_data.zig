@@ -1,5 +1,5 @@
 const EditorContext = @import("../open.zig").EditorContext;
-const Blob = @import("./webcore/response.zig").Blob;
+const Blob = JSC.WebCore.Blob;
 const default_allocator = @import("bun").default_allocator;
 const Output = @import("bun").Output;
 const RareData = @This();
@@ -24,6 +24,8 @@ tail_cleanup_hook: ?*CleanupHook = null,
 cleanup_hook: ?*CleanupHook = null,
 
 file_polls_: ?*JSC.FilePoll.HiveArray = null,
+
+global_dns_data: ?*JSC.DNS.GlobalData = null,
 
 pub fn filePolls(this: *RareData, vm: *JSC.VirtualMachine) *JSC.FilePoll.HiveArray {
     return this.file_polls_ orelse {
@@ -117,7 +119,7 @@ pub const CleanupHook = struct {
         };
     }
 
-    pub const Function = fn (?*anyopaque) callconv(.C) void;
+    pub const Function = *const fn (?*anyopaque) callconv(.C) void;
 };
 
 pub fn pushCleanupHook(
@@ -126,7 +128,7 @@ pub fn pushCleanupHook(
     ctx: ?*anyopaque,
     func: CleanupHook.Function,
 ) void {
-    var hook = JSC.VirtualMachine.vm.allocator.create(CleanupHook) catch unreachable;
+    var hook = JSC.VirtualMachine.get().allocator.create(CleanupHook) catch unreachable;
     hook.* = CleanupHook.from(globalThis, ctx, func);
     if (this.cleanup_hook == null) {
         this.cleanup_hook = hook;
@@ -227,4 +229,12 @@ pub fn stdin(rare: *RareData) *Blob.Store {
         rare.stdin_store = store;
         break :brk store;
     };
+}
+
+pub fn globalDNSResolver(rare: *RareData, vm: *JSC.VirtualMachine) *JSC.DNS.DNSResolver {
+    if (rare.global_dns_data == null) {
+        rare.global_dns_data = JSC.DNS.GlobalData.init(vm.allocator, vm);
+    }
+
+    return &rare.global_dns_data.?.resolver;
 }

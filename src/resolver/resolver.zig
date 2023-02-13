@@ -214,7 +214,7 @@ pub const Result = struct {
             try log.addMsg(Msg{
                 .kind = .err,
                 .data = logger.rangeData(_source, r, std.fmt.allocPrint(m.notes.allocator, fmt, args)),
-                .notes = m.toOwnedSlice(),
+                .notes = try m.toOwnedSlice(),
             });
         }
     };
@@ -240,7 +240,7 @@ pub const DirEntryResolveQueueItem = struct {
 };
 
 threadlocal var _dir_entry_paths_to_resolve: [256]DirEntryResolveQueueItem = undefined;
-threadlocal var _open_dirs: [256]std.fs.Dir = undefined;
+threadlocal var _open_dirs: [256]std.fs.IterableDir = undefined;
 threadlocal var resolve_without_remapping_buf: [bun.MAX_PATH_BYTES]u8 = undefined;
 threadlocal var index_buf: [bun.MAX_PATH_BYTES]u8 = undefined;
 threadlocal var dir_info_uncached_filename_buf: [bun.MAX_PATH_BYTES]u8 = undefined;
@@ -330,7 +330,7 @@ pub const PendingResolution = struct {
     esm: ESModule.Package.External = .{},
     dependency: Dependency.Version = .{},
     resolution_id: Install.PackageID = Install.invalid_package_id,
-    root_dependency_id: Install.PackageID = Install.invalid_package_id,
+    root_dependency_id: Install.DependencyID = Install.invalid_package_id,
     import_record_id: u32 = std.math.maxInt(u32),
     string_buf: []u8 = "",
     tag: Tag,
@@ -396,7 +396,7 @@ const Timer = @import("../system_timer.zig").Timer;
 
 pub const AnyResolveWatcher = struct {
     context: *anyopaque,
-    callback: fn (*anyopaque, dir_path: string, dir_fd: StoredFileDescriptorType) void = undefined,
+    callback: *const (fn (*anyopaque, dir_path: string, dir_fd: StoredFileDescriptorType) void) = undefined,
 
     pub fn watch(this: @This(), dir_path: string, fd: StoredFileDescriptorType) void {
         return this.callback(this.context, dir_path, fd);
@@ -429,6 +429,10 @@ pub const Resolver = struct {
 
     care_about_bin_folder: bool = false,
     care_about_scripts: bool = false,
+
+    /// Read the "browser" field in package.json files?
+    /// For Bun's runtime, we don't.
+    care_about_browser_field: bool = true,
 
     debug_logs: ?DebugLogs = null,
     elapsed: u64 = 0, // tracing
@@ -528,6 +532,7 @@ pub const Resolver = struct {
             .node_module_bundle = opts.node_modules_bundle,
             .log = log,
             .extension_order = opts.extension_order,
+            .care_about_browser_field = opts.platform.isWebLike(),
         };
     }
 
@@ -549,9 +554,9 @@ pub const Resolver = struct {
     pub fn flushDebugLogs(r: *ThisResolver, flush_mode: DebugLogs.FlushMode) !void {
         if (r.debug_logs) |*debug| {
             if (flush_mode == DebugLogs.FlushMode.fail) {
-                try r.log.addRangeDebugWithNotes(null, logger.Range{ .loc = logger.Loc{} }, debug.what, debug.notes.toOwnedSlice());
+                try r.log.addRangeDebugWithNotes(null, logger.Range{ .loc = logger.Loc{} }, debug.what, try debug.notes.toOwnedSlice());
             } else if (@enumToInt(r.log.level) <= @enumToInt(logger.Log.Level.verbose)) {
-                try r.log.addVerboseWithNotes(null, logger.Loc.Empty, debug.what, debug.notes.toOwnedSlice());
+                try r.log.addVerboseWithNotes(null, logger.Loc.Empty, debug.what, try debug.notes.toOwnedSlice());
             }
         }
     }
@@ -803,7 +808,8 @@ pub const Resolver = struct {
         // defer r.mutex.unlock();
         errdefer (r.flushDebugLogs(.fail) catch {});
 
-        switch (r.resolveWithoutSymlinks(source_dir, import_path, kind, global_cache)) {
+        var tmp = r.resolveWithoutSymlinks(source_dir, import_path, kind, global_cache);
+        switch (tmp) {
             .success => |*result| {
                 if (!strings.eqlComptime(result.path_pair.primary.namespace, "node"))
                     r.finalizeResult(result, kind) catch |err| return .{ .failure = err };
@@ -889,7 +895,7 @@ pub const Resolver = struct {
                             var file = try std.fs.openFileAbsoluteZ(span, .{ .mode = .read_only });
 
                             if (comptime !FeatureFlags.store_file_descriptors) {
-                                out = try std.os.getFdPath(query.entry.cache.fd, &buf);
+                                out = try bun.getFdPath(query.entry.cache.fd, &buf);
                                 file.close();
                             } else {
                                 query.entry.cache.fd = file.handle;
@@ -908,7 +914,7 @@ pub const Resolver = struct {
                         }
 
                         if (comptime FeatureFlags.store_file_descriptors) {
-                            out = try std.os.getFdPath(query.entry.cache.fd, &buf);
+                            out = try bun.getFdPath(query.entry.cache.fd, &buf);
                         }
 
                         const symlink = try Fs.FileSystem.FilenameStore.instance.append(@TypeOf(out), out);
@@ -1050,41 +1056,43 @@ pub const Resolver = struct {
             }
 
             // Check the "browser" map
-            if (r.dirInfoCached(std.fs.path.dirname(abs_path) orelse unreachable) catch null) |_import_dir_info| {
-                if (_import_dir_info.getEnclosingBrowserScope()) |import_dir_info| {
-                    const pkg = import_dir_info.package_json.?;
-                    if (r.checkBrowserMap(
-                        import_dir_info,
-                        abs_path,
-                        .AbsolutePath,
-                    )) |remap| {
+            if (r.care_about_browser_field) {
+                if (r.dirInfoCached(std.fs.path.dirname(abs_path) orelse unreachable) catch null) |_import_dir_info| {
+                    if (_import_dir_info.getEnclosingBrowserScope()) |import_dir_info| {
+                        const pkg = import_dir_info.package_json.?;
+                        if (r.checkBrowserMap(
+                            import_dir_info,
+                            abs_path,
+                            .AbsolutePath,
+                        )) |remap| {
 
-                        // Is the path disabled?
-                        if (remap.len == 0) {
-                            var _path = Path.init(r.fs.dirname_store.append(string, abs_path) catch unreachable);
-                            _path.is_disabled = true;
-                            return .{
-                                .success = Result{
-                                    .path_pair = PathPair{
-                                        .primary = _path,
+                            // Is the path disabled?
+                            if (remap.len == 0) {
+                                var _path = Path.init(r.fs.dirname_store.append(string, abs_path) catch unreachable);
+                                _path.is_disabled = true;
+                                return .{
+                                    .success = Result{
+                                        .path_pair = PathPair{
+                                            .primary = _path,
+                                        },
                                     },
-                                },
-                            };
-                        }
-
-                        switch (r.resolveWithoutRemapping(import_dir_info, remap, kind, global_cache)) {
-                            .success => |_result| {
-                                result = Result{
-                                    .path_pair = _result.path_pair,
-                                    .diff_case = _result.diff_case,
-                                    .dirname_fd = _result.dirname_fd,
-                                    .package_json = pkg,
-                                    .jsx = r.opts.jsx,
                                 };
-                                check_relative = false;
-                                check_package = false;
-                            },
-                            else => {},
+                            }
+
+                            switch (r.resolveWithoutRemapping(import_dir_info, remap, kind, global_cache)) {
+                                .success => |_result| {
+                                    result = Result{
+                                        .path_pair = _result.path_pair,
+                                        .diff_case = _result.diff_case,
+                                        .dirname_fd = _result.dirname_fd,
+                                        .package_json = pkg,
+                                        .jsx = r.opts.jsx,
+                                    };
+                                    check_relative = false;
+                                    check_package = false;
+                                },
+                                else => {},
+                            }
                         }
                     }
                 }
@@ -1128,7 +1136,7 @@ pub const Resolver = struct {
                     // "fs/*"
                     // These are disabled!
                 } else if (had_node_prefix or
-                    (import_path_without_node_prefix.len >= 2 and strings.eqlComptimeIgnoreLen(import_path_without_node_prefix[0..2], "fs") and
+                    (strings.hasPrefixComptime(import_path_without_node_prefix, "fs") and
                     (import_path_without_node_prefix.len == 2 or
                     import_path_without_node_prefix[3] == '/')))
                 {
@@ -1167,53 +1175,55 @@ pub const Resolver = struct {
 
             var source_dir_info = (r.dirInfoCached(source_dir) catch null) orelse return .{ .not_found = {} };
 
-            // Support remapping one package path to another via the "browser" field
-            if (source_dir_info.getEnclosingBrowserScope()) |browser_scope| {
-                if (browser_scope.package_json) |package_json| {
-                    if (r.checkBrowserMap(
-                        browser_scope,
-                        import_path,
-                        .PackagePath,
-                    )) |remapped| {
-                        if (remapped.len == 0) {
-                            // "browser": {"module": false}
-                            // does the module exist in the filesystem?
-                            switch (r.loadNodeModules(import_path, kind, source_dir_info, global_cache, false)) {
-                                .success => |node_module| {
-                                    var pair = node_module.path_pair;
-                                    pair.primary.is_disabled = true;
-                                    if (pair.secondary != null) {
-                                        pair.secondary.?.is_disabled = true;
-                                    }
-                                    return .{
-                                        .success = Result{
-                                            .path_pair = pair,
-                                            .dirname_fd = node_module.dirname_fd,
-                                            .diff_case = node_module.diff_case,
-                                            .package_json = package_json,
-                                            .jsx = r.opts.jsx,
-                                        },
-                                    };
-                                },
-                                else => {
-                                    // "browser": {"module": false}
-                                    // the module doesn't exist and it's disabled
-                                    // so we should just not try to load it
-                                    var primary = Path.init(import_path);
-                                    primary.is_disabled = true;
-                                    return .{
-                                        .success = Result{
-                                            .path_pair = PathPair{ .primary = primary },
-                                            .diff_case = null,
-                                            .jsx = r.opts.jsx,
-                                        },
-                                    };
-                                },
+            if (r.care_about_browser_field) {
+                // Support remapping one package path to another via the "browser" field
+                if (source_dir_info.getEnclosingBrowserScope()) |browser_scope| {
+                    if (browser_scope.package_json) |package_json| {
+                        if (r.checkBrowserMap(
+                            browser_scope,
+                            import_path,
+                            .PackagePath,
+                        )) |remapped| {
+                            if (remapped.len == 0) {
+                                // "browser": {"module": false}
+                                // does the module exist in the filesystem?
+                                switch (r.loadNodeModules(import_path, kind, source_dir_info, global_cache, false)) {
+                                    .success => |node_module| {
+                                        var pair = node_module.path_pair;
+                                        pair.primary.is_disabled = true;
+                                        if (pair.secondary != null) {
+                                            pair.secondary.?.is_disabled = true;
+                                        }
+                                        return .{
+                                            .success = Result{
+                                                .path_pair = pair,
+                                                .dirname_fd = node_module.dirname_fd,
+                                                .diff_case = node_module.diff_case,
+                                                .package_json = package_json,
+                                                .jsx = r.opts.jsx,
+                                            },
+                                        };
+                                    },
+                                    else => {
+                                        // "browser": {"module": false}
+                                        // the module doesn't exist and it's disabled
+                                        // so we should just not try to load it
+                                        var primary = Path.init(import_path);
+                                        primary.is_disabled = true;
+                                        return .{
+                                            .success = Result{
+                                                .path_pair = PathPair{ .primary = primary },
+                                                .diff_case = null,
+                                                .jsx = r.opts.jsx,
+                                            },
+                                        };
+                                    },
+                                }
                             }
-                        }
 
-                        import_path = remapped;
-                        source_dir_info = browser_scope;
+                            import_path = remapped;
+                            source_dir_info = browser_scope;
+                        }
                     }
                 }
             }
@@ -1232,7 +1242,7 @@ pub const Resolver = struct {
                         return .{ .success = result };
                     }
 
-                    if (res.package_json != null) {
+                    if (res.package_json != null and r.care_about_browser_field) {
                         var base_dir_info = res.dir_info orelse (r.readDirInfo(res.path_pair.primary.name.dir) catch null) orelse return .{ .success = result };
                         if (base_dir_info.getEnclosingBrowserScope()) |browser_scope| {
                             if (r.checkBrowserMap(
@@ -1277,7 +1287,7 @@ pub const Resolver = struct {
         r: *ThisResolver,
         result: *const Result,
     ) ?*const PackageJSON {
-        return @call(.{ .modifier = .always_inline }, packageJSONForResolvedNodeModuleWithIgnoreMissingName, .{ r, result, true });
+        return @call(.always_inline, packageJSONForResolvedNodeModuleWithIgnoreMissingName, .{ r, result, true });
     }
 
     // This is a fallback, hopefully not called often. It should be relatively quick because everything should be in the cache.
@@ -1361,6 +1371,14 @@ pub const Resolver = struct {
                 .package_json = dir_info.package_json orelse return null,
             };
         }
+    }
+
+    const dev = Output.scoped(.Resolver, false);
+
+    pub fn bustDirCache(r: *ThisResolver, path: string) void {
+        dev("Bust {s}", .{path});
+        r.fs.fs.bustEntriesCache(path);
+        r.dir_cache.remove(path);
     }
 
     threadlocal var esm_subpath_buf: [512]u8 = undefined;
@@ -1463,10 +1481,52 @@ pub const Resolver = struct {
                                 // want problems due to Windows paths, which are very unlike URL
                                 // paths. We also want to avoid any "%" characters in the absolute
                                 // directory path accidentally being interpreted as URL escapes.
-                                const esm_resolution = esmodule.resolve("/", esm.subpath, exports_map.root);
+                                {
+                                    const esm_resolution = esmodule.resolve("/", esm.subpath, exports_map.root);
 
-                                if (r.handleESMResolution(esm_resolution, abs_package_path, kind, package_json, esm.subpath)) |result| {
-                                    return .{ .success = result };
+                                    if (r.handleESMResolution(esm_resolution, abs_package_path, kind, package_json, esm.subpath)) |result| {
+                                        var result_copy = result;
+                                        result_copy.is_node_module = true;
+                                        return .{ .success = result_copy };
+                                    }
+                                }
+
+                                // Some popular packages forget to include the extension in their
+                                // exports map, so we try again without the extension.
+                                //
+                                // This is useful for browser-like environments
+                                // where you want a file extension in the URL
+                                // pathname by convention. Vite does this.
+                                //
+                                // React is an example of a package that doesn't include file extensions.
+                                // {
+                                //     "exports": {
+                                //         ".": "./index.js",
+                                //         "./jsx-runtime": "./jsx-runtime.js",
+                                //     }
+                                // }
+                                //
+                                // We limit this behavior just to ".js" files.
+                                const extname = std.fs.path.extension(esm.subpath);
+                                if (strings.eqlComptime(extname, ".js") and esm.subpath.len > 3) {
+                                    const esm_resolution = esmodule.resolve("/", esm.subpath[0 .. esm.subpath.len - 3], exports_map.root);
+                                    if (r.handleESMResolution(esm_resolution, abs_package_path, kind, package_json, esm.subpath)) |result| {
+                                        return .{ .success = result };
+                                    }
+                                }
+
+                                // if they hid "package.json" from "exports", still allow importing it.
+                                if (strings.eqlComptime(esm.subpath, "./package.json")) {
+                                    return .{
+                                        .success = .{
+                                            .path_pair = .{ .primary = package_json.source.path },
+                                            .dirname_fd = pkg_dir_info.getFileDescriptor(),
+                                            .file_fd = 0,
+                                            .is_node_module = package_json.source.path.isNodeModule(),
+                                            .package_json = package_json,
+                                            .dir_info = dir_info,
+                                        },
+                                    };
                                 }
 
                                 return .{ .not_found = {} };
@@ -1518,8 +1578,7 @@ pub const Resolver = struct {
                         }
 
                         for (dependencies_list) |dependency, dependency_id| {
-                            const dep_name_ = &dependency.name;
-                            const dep_name = dep_name_.slice(string_buf);
+                            const dep_name = dependency.name.slice(string_buf);
                             if (dep_name.len == esm.name.len) {
                                 if (!strings.eqlLong(dep_name, esm.name, false)) {
                                     continue;
@@ -1568,6 +1627,7 @@ pub const Resolver = struct {
                             }
                             dependency_version = Dependency.parse(
                                 r.allocator,
+                                Semver.String.init(esm.name, esm.name),
                                 esm.version,
                                 &sliced_string,
                                 r.log,
@@ -1627,9 +1687,10 @@ pub const Resolver = struct {
                                 if (st == .extract)
                                     manager.enqueuePackageForDownload(
                                         esm.name,
+                                        manager.lockfile.buffers.legacyPackageToDependencyID(resolved_package_id) catch unreachable,
                                         resolved_package_id,
                                         resolution.value.npm.version,
-                                        manager.lockfile.str(resolution.value.npm.url),
+                                        manager.lockfile.str(&resolution.value.npm.url),
                                         .{
                                             .root_request_id = 0,
                                         },
@@ -1680,11 +1741,54 @@ pub const Resolver = struct {
                                 // want problems due to Windows paths, which are very unlike URL
                                 // paths. We also want to avoid any "%" characters in the absolute
                                 // directory path accidentally being interpreted as URL escapes.
-                                const esm_resolution = esmodule.resolve("/", esm.subpath, exports_map.root);
+                                {
+                                    const esm_resolution = esmodule.resolve("/", esm.subpath, exports_map.root);
 
-                                if (r.handleESMResolution(esm_resolution, abs_package_path, kind, package_json, esm.subpath)) |*result| {
-                                    result.is_node_module = true;
-                                    return .{ .success = result.* };
+                                    if (r.handleESMResolution(esm_resolution, abs_package_path, kind, package_json, esm.subpath)) |result| {
+                                        var result_copy = result;
+                                        result_copy.is_node_module = true;
+                                        return .{ .success = result_copy };
+                                    }
+                                }
+
+                                // Some popular packages forget to include the extension in their
+                                // exports map, so we try again without the extension.
+                                //
+                                // This is useful for browser-like environments
+                                // where you want a file extension in the URL
+                                // pathname by convention. Vite does this.
+                                //
+                                // React is an example of a package that doesn't include file extensions.
+                                // {
+                                //     "exports": {
+                                //         ".": "./index.js",
+                                //         "./jsx-runtime": "./jsx-runtime.js",
+                                //     }
+                                // }
+                                //
+                                // We limit this behavior just to ".js" files.
+                                const extname = std.fs.path.extension(esm.subpath);
+                                if (strings.eqlComptime(extname, ".js") and esm.subpath.len > 3) {
+                                    const esm_resolution = esmodule.resolve("/", esm.subpath[0 .. esm.subpath.len - 3], exports_map.root);
+                                    if (r.handleESMResolution(esm_resolution, abs_package_path, kind, package_json, esm.subpath)) |result| {
+                                        var result_copy = result;
+                                        result_copy.is_node_module = true;
+                                        return .{ .success = result_copy };
+                                    }
+                                }
+
+                                // if they hid "package.json" from "exports", still allow importing it.
+                                if (strings.eqlComptime(esm.subpath, "./package.json")) {
+                                    return .{
+                                        .success = .{
+                                            .path_pair = .{ .primary = package_json.source.path },
+                                            .dirname_fd = pkg_dir_info.getFileDescriptor(),
+                                            .file_fd = 0,
+                                            .is_node_module = package_json.source.path.isNodeModule(),
+                                            .package_json = package_json,
+                                            .dir_info = dir_info,
+                                        },
+                                    };
                                 }
 
                                 return .{ .not_found = {} };
@@ -1697,7 +1801,8 @@ pub const Resolver = struct {
                             debug.addNoteFmt("Checking for a package in the directory \"{s}\"", .{abs_path});
                         }
 
-                        if (r.loadAsFileOrDirectory(abs_path, kind)) |*res| {
+                        var tmp = r.loadAsFileOrDirectory(abs_path, kind);
+                        if (tmp) |*res| {
                             res.is_node_module = true;
                             return .{ .success = res.* };
                         }
@@ -1714,7 +1819,7 @@ pub const Resolver = struct {
     }
     fn dirInfoForResolution(
         r: *ThisResolver,
-        dir_path: []const u8,
+        dir_path: string,
         package_id: Install.PackageID,
     ) !?*DirInfo {
         std.debug.assert(r.package_manager != null);
@@ -1728,8 +1833,8 @@ pub const Resolver = struct {
         var cached_dir_entry_result = rfs.entries.getOrPut(dir_path) catch unreachable;
 
         var dir_entries_option: *Fs.FileSystem.RealFS.EntriesOption = undefined;
-        var needs_iter: bool = true;
-        var open_dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| {
+        var needs_iter = true;
+        var open_dir = std.fs.cwd().openIterableDir(dir_path, .{}) catch |err| {
             switch (err) {
                 error.FileNotFound => unreachable,
                 else => {
@@ -1750,12 +1855,14 @@ pub const Resolver = struct {
         if (needs_iter) {
             const allocator = r.fs.allocator;
             dir_entries_option = rfs.entries.put(&cached_dir_entry_result, .{
-                .entries = Fs.FileSystem.DirEntry.init(dir_path),
+                .entries = Fs.FileSystem.DirEntry.init(
+                    Fs.FileSystem.DirnameStore.instance.append(string, dir_path) catch unreachable,
+                ),
             }) catch unreachable;
 
             if (FeatureFlags.store_file_descriptors) {
-                Fs.FileSystem.setMaxFd(open_dir.fd);
-                dir_entries_option.entries.fd = open_dir.fd;
+                Fs.FileSystem.setMaxFd(open_dir.dir.fd);
+                dir_entries_option.entries.fd = open_dir.dir.fd;
             }
             var dir_iterator = open_dir.iterate();
             while (dir_iterator.next() catch null) |_value| {
@@ -1765,7 +1872,7 @@ pub const Resolver = struct {
 
         // We must initialize it as empty so that the result index is correct.
         // This is important so that browser_scope has a valid index.
-        var dir_info_ptr = r.dir_cache.put(&dir_cache_info_result, DirInfo{}) catch unreachable;
+        var dir_info_ptr = r.dir_cache.put(&dir_cache_info_result, .{}) catch unreachable;
 
         try r.dirInfoUncached(
             dir_info_ptr,
@@ -1777,7 +1884,7 @@ pub const Resolver = struct {
             // to check for a parent package.json
             null,
             allocators.NotFound,
-            open_dir.fd,
+            open_dir.dir.fd,
             package_id,
         );
         return dir_info_ptr;
@@ -1817,9 +1924,7 @@ pub const Resolver = struct {
         if (is_main) {
             if (package_json_) |package_json| {
                 package = Package.fromPackageJSON(
-                    pm.allocator,
                     pm.lockfile,
-                    r.log,
                     package_json,
                     Install.Features{
                         .dev_dependencies = true,
@@ -1830,12 +1935,6 @@ pub const Resolver = struct {
                 ) catch |err| {
                     return .{ .failure = err };
                 };
-
-                package.resolution = .{
-                    .tag = .root,
-                    .value = .{ .root = {} },
-                };
-
                 package = pm.lockfile.appendPackage(package) catch |err| {
                     return .{ .failure = err };
                 };
@@ -1844,11 +1943,11 @@ pub const Resolver = struct {
                 // we're resolving an unknown package
                 // the unknown package is the root package
                 package = Package{
-                    .name = Semver.String.init("", ""),
-                };
-                package.resolution = .{
-                    .tag = .root,
-                    .value = .{ .root = {} },
+                    .name = Semver.String.from(""),
+                    .resolution = .{
+                        .tag = .root,
+                        .value = .{ .root = {} },
+                    },
                 };
                 package = pm.lockfile.appendPackage(package) catch |err| {
                     return .{ .failure = err };
@@ -1867,7 +1966,7 @@ pub const Resolver = struct {
 
             // All packages are enqueued to the root
             // because we download all the npm package dependencies
-            switch (pm.enqueueDependencyToRoot(esm.name, esm.version, version, behavior, is_main)) {
+            switch (pm.enqueueDependencyToRoot(esm.name, esm.version, &version, behavior, is_main)) {
                 .resolution => |result| {
                     input_package_id_.* = result.package_id;
                     return .{ .resolution = result.resolution };
@@ -1882,7 +1981,6 @@ pub const Resolver = struct {
                         .pending = .{
                             .esm = cloned,
                             .dependency = version,
-                            .resolution_id = Install.invalid_package_id,
                             .root_dependency_id = id,
                             .string_buf = builder.allocatedSlice(),
                             .tag = .resolve,
@@ -2011,10 +2109,11 @@ pub const Resolver = struct {
                 // If this was resolved against an expansion key ending in a "/"
                 // instead of a "*", we need to try CommonJS-style implicit
                 // extension and/or directory detection.
-                if (r.loadAsFileOrDirectory(abs_esm_path, kind)) |*res| {
-                    res.is_node_module = true;
-                    res.package_json = res.package_json orelse package_json;
-                    return res.*;
+                if (r.loadAsFileOrDirectory(abs_esm_path, kind)) |res| {
+                    var res_copy = res;
+                    res_copy.is_node_module = true;
+                    res_copy.package_json = res.package_json orelse package_json;
+                    return res_copy;
                 }
                 esm_resolution.status = .ModuleNotFound;
                 return null;
@@ -2238,9 +2337,9 @@ pub const Resolver = struct {
 
             // Anything
             if (open_dir_count > 0 and r.fs.fs.needToCloseFiles()) {
-                var open_dirs: []std.fs.Dir = _open_dirs[0..open_dir_count];
+                var open_dirs: []std.fs.IterableDir = _open_dirs[0..open_dir_count];
                 for (open_dirs) |*open_dir| {
-                    open_dir.close();
+                    open_dir.dir.close();
                 }
             }
         }
@@ -2265,7 +2364,7 @@ pub const Resolver = struct {
             defer top_parent = queue_top.result;
             queue_slice.len -= 1;
 
-            var _open_dir: anyerror!std.fs.Dir = undefined;
+            var _open_dir: anyerror!std.fs.IterableDir = undefined;
             if (queue_top.fd == 0) {
 
                 // This saves us N copies of .toPosixPath
@@ -2274,17 +2373,16 @@ pub const Resolver = struct {
                 path.ptr[queue_top.unsafe_path.len] = 0;
                 defer path.ptr[queue_top.unsafe_path.len] = prev_char;
                 var sentinel = path.ptr[0..queue_top.unsafe_path.len :0];
-                _open_dir = std.fs.openDirAbsoluteZ(
+                _open_dir = std.fs.openIterableDirAbsoluteZ(
                     sentinel,
                     .{
-                        .iterate = true,
                         .no_follow = !follow_symlinks,
                     },
                 );
                 // }
             }
 
-            const open_dir = if (queue_top.fd != 0) std.fs.Dir{ .fd = queue_top.fd } else (_open_dir catch |err| {
+            const open_dir = if (queue_top.fd != 0) std.fs.IterableDir{ .dir = .{ .fd = queue_top.fd } } else (_open_dir catch |err| {
                 switch (err) {
                     error.EACCESS => {},
 
@@ -2329,7 +2427,7 @@ pub const Resolver = struct {
             });
 
             if (queue_top.fd == 0) {
-                Fs.FileSystem.setMaxFd(open_dir.fd);
+                Fs.FileSystem.setMaxFd(open_dir.dir.fd);
                 // these objects mostly just wrap the file descriptor, so it's fine to keep it.
                 _open_dirs[open_dir_count] = open_dir;
                 open_dir_count += 1;
@@ -2379,8 +2477,8 @@ pub const Resolver = struct {
                 });
 
                 if (FeatureFlags.store_file_descriptors) {
-                    Fs.FileSystem.setMaxFd(open_dir.fd);
-                    dir_entries_option.entries.fd = open_dir.fd;
+                    Fs.FileSystem.setMaxFd(open_dir.dir.fd);
+                    dir_entries_option.entries.fd = open_dir.dir.fd;
                 }
                 var dir_iterator = open_dir.iterate();
                 while (try dir_iterator.next()) |_value| {
@@ -2400,7 +2498,7 @@ pub const Resolver = struct {
                 cached_dir_entry_result.index,
                 r.dir_cache.atIndex(top_parent.index),
                 top_parent.index,
-                open_dir.fd,
+                open_dir.dir.fd,
                 null,
             );
 
@@ -2754,29 +2852,31 @@ pub const Resolver = struct {
             }
         }
 
-        // Potentially remap using the "browser" field
-        if (dir_info.getEnclosingBrowserScope()) |browser_scope| {
-            if (browser_scope.package_json) |browser_json| {
-                if (r.checkBrowserMap(
-                    browser_scope,
-                    field_rel_path,
-                    .AbsolutePath,
-                )) |remap| {
-                    // Is the path disabled?
-                    if (remap.len == 0) {
-                        const paths = [_]string{ path, field_rel_path };
-                        const new_path = r.fs.absAlloc(r.allocator, &paths) catch unreachable;
-                        var _path = Path.init(new_path);
-                        _path.is_disabled = true;
-                        return MatchResult{
-                            .path_pair = PathPair{
-                                .primary = _path,
-                            },
-                            .package_json = browser_json,
-                        };
-                    }
+        if (r.care_about_browser_field) {
+            // Potentially remap using the "browser" field
+            if (dir_info.getEnclosingBrowserScope()) |browser_scope| {
+                if (browser_scope.package_json) |browser_json| {
+                    if (r.checkBrowserMap(
+                        browser_scope,
+                        field_rel_path,
+                        .AbsolutePath,
+                    )) |remap| {
+                        // Is the path disabled?
+                        if (remap.len == 0) {
+                            const paths = [_]string{ path, field_rel_path };
+                            const new_path = r.fs.absAlloc(r.allocator, &paths) catch unreachable;
+                            var _path = Path.init(new_path);
+                            _path.is_disabled = true;
+                            return MatchResult{
+                                .path_pair = PathPair{
+                                    .primary = _path,
+                                },
+                                .package_json = browser_json,
+                            };
+                        }
 
-                    field_rel_path = remap;
+                        field_rel_path = remap;
+                    }
                 }
             }
         }
@@ -2872,46 +2972,48 @@ pub const Resolver = struct {
             path = remap_path_trailing_slash[0 .. path.len + 1];
         }
 
-        if (dir_info.getEnclosingBrowserScope()) |browser_scope| {
-            const field_rel_path = comptime "index";
+        if (r.care_about_browser_field) {
+            if (dir_info.getEnclosingBrowserScope()) |browser_scope| {
+                const field_rel_path = comptime "index";
 
-            if (browser_scope.package_json) |browser_json| {
-                if (r.checkBrowserMap(
-                    browser_scope,
-                    field_rel_path,
-                    .AbsolutePath,
-                )) |remap| {
+                if (browser_scope.package_json) |browser_json| {
+                    if (r.checkBrowserMap(
+                        browser_scope,
+                        field_rel_path,
+                        .AbsolutePath,
+                    )) |remap| {
 
-                    // Is the path disabled?
-                    if (remap.len == 0) {
-                        const paths = [_]string{ path, field_rel_path };
-                        const new_path = r.fs.absBuf(&paths, &remap_path_buf);
-                        var _path = Path.init(new_path);
-                        _path.is_disabled = true;
-                        return MatchResult{
-                            .path_pair = PathPair{
-                                .primary = _path,
-                            },
-                            .package_json = browser_json,
-                        };
-                    }
-
-                    const new_paths = [_]string{ path, remap };
-                    const remapped_abs = r.fs.absBuf(&new_paths, &remap_path_buf);
-
-                    // Is this a file
-                    if (r.loadAsFile(remapped_abs, extension_order)) |file_result| {
-                        return MatchResult{ .dirname_fd = file_result.dirname_fd, .path_pair = .{ .primary = Path.init(file_result.path) }, .diff_case = file_result.diff_case };
-                    }
-
-                    // Is it a directory with an index?
-                    if (r.dirInfoCached(remapped_abs) catch null) |new_dir| {
-                        if (r.loadAsIndex(new_dir, extension_order)) |absolute| {
-                            return absolute;
+                        // Is the path disabled?
+                        if (remap.len == 0) {
+                            const paths = [_]string{ path, field_rel_path };
+                            const new_path = r.fs.absBuf(&paths, &remap_path_buf);
+                            var _path = Path.init(new_path);
+                            _path.is_disabled = true;
+                            return MatchResult{
+                                .path_pair = PathPair{
+                                    .primary = _path,
+                                },
+                                .package_json = browser_json,
+                            };
                         }
-                    }
 
-                    return null;
+                        const new_paths = [_]string{ path, remap };
+                        const remapped_abs = r.fs.absBuf(&new_paths, &remap_path_buf);
+
+                        // Is this a file
+                        if (r.loadAsFile(remapped_abs, extension_order)) |file_result| {
+                            return MatchResult{ .dirname_fd = file_result.dirname_fd, .path_pair = .{ .primary = Path.init(file_result.path) }, .diff_case = file_result.diff_case };
+                        }
+
+                        // Is it a directory with an index?
+                        if (r.dirInfoCached(remapped_abs) catch null) |new_dir| {
+                            if (r.loadAsIndex(new_dir, extension_order)) |absolute| {
+                                return absolute;
+                            }
+                        }
+
+                        return null;
+                    }
                 }
             }
         }
@@ -3058,9 +3160,10 @@ pub const Resolver = struct {
         }
 
         // Look for an "index" file with known extensions
-        if (r.loadAsIndexWithBrowserRemapping(dir_info, path, extension_order)) |*res| {
-            res.package_json = res.package_json orelse package_json;
-            return res.*;
+        if (r.loadAsIndexWithBrowserRemapping(dir_info, path, extension_order)) |res| {
+            var res_copy = res;
+            res_copy.package_json = res.package_json orelse package_json;
+            return res_copy;
         }
 
         return null;
@@ -3297,9 +3400,9 @@ pub const Resolver = struct {
                         }
 
                         const this_dir = std.fs.Dir{ .fd = fd };
-                        var file = this_dir.openDirZ("node_modules/.bin", .{}) catch break :append_bin_dir;
+                        var file = this_dir.openDirZ("node_modules/.bin", .{}, true) catch break :append_bin_dir;
                         defer file.close();
-                        var bin_path = std.os.getFdPath(file.fd, &node_bin_path) catch break :append_bin_dir;
+                        var bin_path = bun.getFdPath(file.fd, &node_bin_path) catch break :append_bin_dir;
                         bin_folders_lock.lock();
                         defer bin_folders_lock.unlock();
 
@@ -3322,9 +3425,9 @@ pub const Resolver = struct {
                             }
 
                             const this_dir = std.fs.Dir{ .fd = fd };
-                            var file = this_dir.openDirZ(".bin", .{}) catch break :append_bin_dir;
+                            var file = this_dir.openDirZ(".bin", .{}, false) catch break :append_bin_dir;
                             defer file.close();
-                            var bin_path = std.os.getFdPath(file.fd, &node_bin_path) catch break :append_bin_dir;
+                            var bin_path = bun.getFdPath(file.fd, &node_bin_path) catch break :append_bin_dir;
                             bin_folders_lock.lock();
                             defer bin_folders_lock.unlock();
 

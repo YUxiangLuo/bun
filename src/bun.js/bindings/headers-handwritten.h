@@ -207,6 +207,7 @@ enum SyntheticModuleType : uint64_t {
     StringDecoder = 1027,
     Module = 1028,
     TTY = 1029,
+    NodeUtilTypes = 1030,
 };
 
 extern "C" const char* Bun__userAgent;
@@ -250,15 +251,20 @@ extern "C" bool Bun__fetchBuiltinModule(
 extern "C" const char* Bun__version;
 
 // Used in process.versions
-extern "C" const char* Bun__versions_webkit;
-extern "C" const char* Bun__versions_mimalloc;
-extern "C" const char* Bun__versions_libarchive;
-extern "C" const char* Bun__versions_picohttpparser;
 extern "C" const char* Bun__versions_boringssl;
-extern "C" const char* Bun__versions_zlib;
-extern "C" const char* Bun__version_sha;
-
+extern "C" const char* Bun__versions_libarchive;
+extern "C" const char* Bun__versions_mimalloc;
+extern "C" const char* Bun__versions_picohttpparser;
+extern "C" const char* Bun__versions_uws;
+extern "C" const char* Bun__versions_webkit;
 extern "C" const char* Bun__versions_zig;
+extern "C" const char* Bun__versions_zlib;
+extern "C" const char* Bun__versions_tinycc;
+extern "C" const char* Bun__versions_lolhtml;
+extern "C" const char* Bun__versions_c_ares;
+extern "C" const char* Bun__versions_usockets;
+
+extern "C" const char* Bun__version_sha;
 
 extern "C" void ZigString__free_global(const unsigned char* ptr, size_t len);
 

@@ -25,7 +25,7 @@
 
 function getStdioWriteStream(fd_, rawRequire) {
   var module = { path: "node:process", require: rawRequire };
-  var require = (path) => module.require(path);
+  var require = path => module.require(path);
 
   function createStdioWriteStream(fd_) {
     var { Duplex, eos, destroy } = require("node:stream");
@@ -72,18 +72,9 @@ function getStdioWriteStream(fd_, rawRequire) {
       _destroy(err, callback) {
         if (!err && this.#onClose !== null) {
           var AbortError = class AbortError extends Error {
-            constructor(
-              message = "The operation was aborted",
-              options = void 0,
-            ) {
+            constructor(message = "The operation was aborted", options = void 0) {
               if (options !== void 0 && typeof options !== "object") {
-                throw new Error(
-                  `Invalid AbortError options:\n\n${JSON.stringify(
-                    options,
-                    null,
-                    2,
-                  )}`,
-                );
+                throw new Error(`Invalid AbortError options:\n\n${JSON.stringify(options, null, 2)}`);
               }
               super(message, options);
               this.code = "ABORT_ERR";
@@ -125,7 +116,7 @@ function getStdioWriteStream(fd_, rawRequire) {
             }
           });
 
-          eos(stream, (err) => {
+          eos(stream, err => {
             this.#writable = false;
             if (err) {
               destroy(stream, err);
@@ -164,7 +155,7 @@ function getStdioWriteStream(fd_, rawRequire) {
           this.push(null);
         });
 
-        eos(readStream, (err) => {
+        eos(readStream, err => {
           this.#readable = false;
           if (err) {
             destroy(readStream, err);
@@ -197,12 +188,7 @@ function getStdioWriteStream(fd_, rawRequire) {
     if (!encoding) return true;
 
     var normalied = encoding.toLowerCase();
-    return (
-      normalied === "utf8" ||
-      normalied === "utf-8" ||
-      normalied === "buffer" ||
-      normalied === "binary"
-    );
+    return normalied === "utf8" || normalied === "utf-8" || normalied === "buffer" || normalied === "binary";
   }
 
   var FastStdioWriteStream = class StdioWriteStream extends EventEmitter {
@@ -356,7 +342,7 @@ function getStdioWriteStream(fd_, rawRequire) {
             this.#performCallback(callback);
             this.emit("drain");
           },
-          (err) => this.#performCallback(callback, err),
+          err => this.#performCallback(callback, err),
         );
         return false;
       }
@@ -435,26 +421,29 @@ function getStdioWriteStream(fd_, rawRequire) {
   return new FastStdioWriteStream(fd_);
 }
 
-function getStdinStream(fd, rawRequire, Bun) {
+function getStdinStream(fd_, rawRequire, Bun) {
   var module = { path: "node:process", require: rawRequire };
-  var require = (path) => module.require(path);
+  var require = path => module.require(path);
 
-  var { Readable, Duplex, eos, destroy } = require("node:stream");
+  var { Duplex, eos, destroy } = require("node:stream");
 
   var StdinStream = class StdinStream extends Duplex {
-    #readStream;
+    #reader;
+    // TODO: investigate https://github.com/oven-sh/bun/issues/1607
+
+    #readRef;
     #writeStream;
 
     #readable = true;
+    #unrefOnRead = false;
     #writable = true;
 
     #onFinish;
     #onClose;
     #onDrain;
-    #onReadable;
 
     get isTTY() {
-      return require("tty").isatty(fd);
+      return require("tty").isatty(fd_);
     }
 
     get fd() {
@@ -463,8 +452,6 @@ function getStdinStream(fd, rawRequire, Bun) {
 
     constructor() {
       super({ readable: true, writable: true });
-
-      this.#onReadable = (...args) => this._read(...args);
     }
 
     #onFinished(err) {
@@ -485,13 +472,7 @@ function getStdinStream(fd, rawRequire, Bun) {
         var AbortError = class AbortError extends Error {
           constructor(message = "The operation was aborted", options = void 0) {
             if (options !== void 0 && typeof options !== "object") {
-              throw new Error(
-                `Invalid AbortError options:\n\n${JSON.stringify(
-                  options,
-                  null,
-                  2,
-                )}`,
-              );
+              throw new Error(`Invalid AbortError options:\n\n${JSON.stringify(options, null, 2)}`);
             }
             super(message, options);
             this.code = "ABORT_ERR";
@@ -505,63 +486,88 @@ function getStdinStream(fd, rawRequire, Bun) {
         callback(err);
       } else {
         this.#onClose = callback;
-        if (this.#readStream) destroy(this.#readStream, err);
         if (this.#writeStream) destroy(this.#writeStream, err);
       }
     }
 
-    on(ev, cb) {
-      super.on(ev, cb);
-      if (!this.#readStream && (ev === "readable" || ev === "data")) {
-        this.#loadReadStream();
+    setRawMode(mode) {}
+    on(name, callback) {
+      // Streams don't generally required to present any data when only
+      // `readable` events are present, i.e. `readableFlowing === false`
+      //
+      // However, Node.js has a this quirk whereby `process.stdin.read()`
+      // blocks under TTY mode, thus looping `.read()` in this particular
+      // case would not result in truncation.
+      //
+      // Therefore the following hack is only specific to `process.stdin`
+      // and does not apply to the underlying Stream implementation.
+      if (name === "readable") {
+        this.ref();
+        this.#unrefOnRead = true;
       }
-
-      return this;
+      return super.on(name, callback);
     }
 
-    once(ev, cb) {
-      super.once(ev, cb);
-      if (!this.#readStream && (ev === "readable" || ev === "data")) {
-        this.#loadReadStream();
-      }
-
-      return this;
+    pause() {
+      this.unref();
+      return super.pause();
     }
 
-    #loadReadStream() {
-      var readStream = (this.#readStream = Readable.fromWeb(
-        Bun.stdin.stream(),
-      ));
-
-      readStream.on("data", (data) => {
-        this.push(data);
-      });
-      readStream.ref();
-
-      readStream.on("end", () => {
-        this.push(null);
-      });
-
-      eos(readStream, (err) => {
-        this.#readable = false;
-        if (err) {
-          destroy(readStream, err);
-        }
-        this.#onFinished(err);
-      });
+    resume() {
+      this.ref();
+      return super.resume();
     }
 
     ref() {
-      this.#readStream?.ref?.();
+      this.#reader ??= Bun.stdin.stream().getReader();
+      this.#readRef ??= setInterval(() => {}, 1 << 30);
     }
+
     unref() {
-      this.#readStream?.unref?.();
+      if (this.#readRef) {
+        clearInterval(this.#readRef);
+        this.#readRef = null;
+      }
     }
 
-    _read(encoding, callback) {
-      if (!this.#readStream) this.#loadReadStream();
+    async #readInternal() {
+      try {
+        var done, value;
+        const read = this.#reader.readMany();
 
-      return this.#readStream._read(...arguments);
+        // read same-tick if possible
+        if (!read?.then) {
+          ({ done, value } = read);
+        } else {
+          ({ done, value } = await read);
+        }
+
+        if (!done) {
+          this.push(value[0]);
+
+          // shouldn't actually happen, but just in case
+          const length = value.length;
+          for (let i = 1; i < length; i++) {
+            this.push(value[i]);
+          }
+        } else {
+          this.push(null);
+          this.pause();
+          this.#readable = false;
+          this.#onFinished();
+        }
+      } catch (err) {
+        this.#readable = false;
+        this.#onFinished(err);
+      }
+    }
+
+    _read(size) {
+      if (this.#unrefOnRead) {
+        this.unref();
+        this.#unrefOnRead = false;
+      }
+      this.#readInternal();
     }
 
     #constructWriteStream() {
@@ -584,7 +590,7 @@ function getStdinStream(fd, rawRequire, Bun) {
         }
       });
 
-      eos(writeStream, (err) => {
+      eos(writeStream, err => {
         this.#writable = false;
         if (err) {
           destroy(writeStream, err);

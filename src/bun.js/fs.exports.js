@@ -1,112 +1,154 @@
 var { direct, isPromise, isCallable } = import.meta.primordials;
+var promises = import.meta.require("node:fs/promises");
 var fs = Bun.fs();
 var debug = process.env.DEBUG ? console.log : () => {};
-
 export var access = function access(...args) {
-  callbackify(fs.accessSync, args);
-};
-export var appendFile = function appendFile(...args) {
-  callbackify(fs.appendFileSync, args);
-};
-export var close = function close(...args) {
-  callbackify(fs.closeSync, args);
-};
-export var rm = function rm(...args) {
-  callbackify(fs.rmSync, args);
-};
-export var copyFile = function copyFile(...args) {
-  callbackify(fs.copyFileSync, args);
-};
-export var exists = function exists(...args) {
-  callbackify(fs.existsSync, args);
-};
-export var chown = function chown(...args) {
-  callbackify(fs.chownSync, args);
-};
-export var chmod = function chmod(...args) {
-  callbackify(fs.chmodSync, args);
-};
-export var fchmod = function fchmod(...args) {
-  callbackify(fs.fchmodSync, args);
-};
-export var fchown = function fchown(...args) {
-  callbackify(fs.fchownSync, args);
-};
-export var fstat = function fstat(...args) {
-  callbackify(fs.fstatSync, args);
-};
-export var fsync = function fsync(...args) {
-  callbackify(fs.fsyncSync, args);
-};
-export var ftruncate = function ftruncate(...args) {
-  callbackify(fs.ftruncateSync, args);
-};
-export var futimes = function futimes(...args) {
-  callbackify(fs.futimesSync, args);
-};
-export var lchmod = function lchmod(...args) {
-  callbackify(fs.lchmodSync, args);
-};
-export var lchown = function lchown(...args) {
-  callbackify(fs.lchownSync, args);
-};
-export var link = function link(...args) {
-  callbackify(fs.linkSync, args);
-};
-export var lstat = function lstat(...args) {
-  callbackify(fs.lstatSync, args);
-};
-export var mkdir = function mkdir(...args) {
-  callbackify(fs.mkdirSync, args);
-};
-export var mkdtemp = function mkdtemp(...args) {
-  callbackify(fs.mkdtempSync, args);
-};
-export var open = function open(...args) {
-  callbackify(fs.openSync, args);
-};
-export var read = function read(...args) {
-  callbackify(fs.readSync, args);
-};
-export var write = function write(...args) {
-  callbackify(fs.writeSync, args);
-};
-export var readdir = function readdir(...args) {
-  callbackify(fs.readdirSync, args);
-};
-export var readFile = function readFile(...args) {
-  callbackify(fs.readFileSync, args);
-};
-export var writeFile = function writeFile(...args) {
-  callbackify(fs.writeFileSync, args);
-};
-export var readlink = function readlink(...args) {
-  callbackify(fs.readlinkSync, args);
-};
-export var realpath = function realpath(...args) {
-  callbackify(fs.realpathSync, args);
-};
-export var rename = function rename(...args) {
-  callbackify(fs.renameSync, args);
-};
-export var stat = function stat(...args) {
-  callbackify(fs.statSync, args);
-};
-export var symlink = function symlink(...args) {
-  callbackify(fs.symlinkSync, args);
-};
-export var truncate = function truncate(...args) {
-  callbackify(fs.truncateSync, args);
-};
-export var unlink = function unlink(...args) {
-  callbackify(fs.unlinkSync, args);
-};
-export var utimes = function utimes(...args) {
-  callbackify(fs.utimesSync, args);
-};
-export var lutimes = function lutimes(...args) {
-  callbackify(fs.lutimesSync, args);
-};
+    callbackify(fs.accessSync, args);
+  },
+  appendFile = function appendFile(...args) {
+    callbackify(fs.appendFileSync, args);
+  },
+  close = function close(...args) {
+    callbackify(fs.closeSync, args);
+  },
+  rm = function rm(...args) {
+    callbackify(fs.rmSync, args);
+  },
+  rmdir = function rmdir(...args) {
+    callbackify(fs.rmdirSync, args);
+  },
+  copyFile = function copyFile(...args) {
+    callbackify(fs.copyFileSync, args);
+  },
+  exists = function exists(...args) {
+    callbackify(fs.existsSync, args);
+  },
+  chown = function chown(...args) {
+    callbackify(fs.chownSync, args);
+  },
+  chmod = function chmod(...args) {
+    callbackify(fs.chmodSync, args);
+  },
+  fchmod = function fchmod(...args) {
+    callbackify(fs.fchmodSync, args);
+  },
+  fchown = function fchown(...args) {
+    callbackify(fs.fchownSync, args);
+  },
+  fstat = function fstat(...args) {
+    callbackify(fs.fstatSync, args);
+  },
+  fsync = function fsync(...args) {
+    callbackify(fs.fsyncSync, args);
+  },
+  ftruncate = function ftruncate(...args) {
+    callbackify(fs.ftruncateSync, args);
+  },
+  futimes = function futimes(...args) {
+    callbackify(fs.futimesSync, args);
+  },
+  lchmod = function lchmod(...args) {
+    callbackify(fs.lchmodSync, args);
+  },
+  lchown = function lchown(...args) {
+    callbackify(fs.lchownSync, args);
+  },
+  link = function link(...args) {
+    callbackify(fs.linkSync, args);
+  },
+  lstat = function lstat(...args) {
+    callbackify(fs.lstatSync, args);
+  },
+  mkdir = function mkdir(...args) {
+    callbackify(fs.mkdirSync, args);
+  },
+  mkdtemp = function mkdtemp(...args) {
+    callbackify(fs.mkdtempSync, args);
+  },
+  open = function open(...args) {
+    callbackify(fs.openSync, args);
+  },
+  read = function read(...args) {
+    callbackify(fs.readSync, args);
+  },
+  write = function write(...args) {
+    callbackify(fs.writeSync, args);
+  },
+  readdir = function readdir(...args) {
+    callbackify(fs.readdirSync, args);
+  },
+  readFile = function readFile(...args) {
+    callbackify(fs.readFileSync, args);
+  },
+  writeFile = function writeFile(...args) {
+    callbackify(fs.writeFileSync, args);
+  },
+  readlink = function readlink(...args) {
+    callbackify(fs.readlinkSync, args);
+  },
+  realpath = function realpath(...args) {
+    callbackify(fs.realpathSync, args);
+  },
+  rename = function rename(...args) {
+    callbackify(fs.renameSync, args);
+  },
+  stat = function stat(...args) {
+    callbackify(fs.statSync, args);
+  },
+  symlink = function symlink(...args) {
+    callbackify(fs.symlinkSync, args);
+  },
+  truncate = function truncate(...args) {
+    callbackify(fs.truncateSync, args);
+  },
+  unlink = function unlink(...args) {
+    callbackify(fs.unlinkSync, args);
+  },
+  utimes = function utimes(...args) {
+    callbackify(fs.utimesSync, args);
+  },
+  lutimes = function lutimes(...args) {
+    callbackify(fs.lutimesSync, args);
+  },
+  accessSync = fs.accessSync.bind(fs),
+  appendFileSync = fs.appendFileSync.bind(fs),
+  closeSync = fs.closeSync.bind(fs),
+  copyFileSync = fs.copyFileSync.bind(fs),
+  existsSync = fs.existsSync.bind(fs),
+  chownSync = fs.chownSync.bind(fs),
+  chmodSync = fs.chmodSync.bind(fs),
+  fchmodSync = fs.fchmodSync.bind(fs),
+  fchownSync = fs.fchownSync.bind(fs),
+  fstatSync = fs.fstatSync.bind(fs),
+  fsyncSync = fs.fsyncSync.bind(fs),
+  ftruncateSync = fs.ftruncateSync.bind(fs),
+  futimesSync = fs.futimesSync.bind(fs),
+  lchmodSync = fs.lchmodSync.bind(fs),
+  lchownSync = fs.lchownSync.bind(fs),
+  linkSync = fs.linkSync.bind(fs),
+  lstatSync = fs.lstatSync.bind(fs),
+  mkdirSync = fs.mkdirSync.bind(fs),
+  mkdtempSync = fs.mkdtempSync.bind(fs),
+  openSync = fs.openSync.bind(fs),
+  readSync = fs.readSync.bind(fs),
+  writeSync = fs.writeSync.bind(fs),
+  readdirSync = fs.readdirSync.bind(fs),
+  readFileSync = fs.readFileSync.bind(fs),
+  writeFileSync = fs.writeFileSync.bind(fs),
+  readlinkSync = fs.readlinkSync.bind(fs),
+  realpathSync = fs.realpathSync.bind(fs),
+  renameSync = fs.renameSync.bind(fs),
+  statSync = fs.statSync.bind(fs),
+  symlinkSync = fs.symlinkSync.bind(fs),
+  truncateSync = fs.truncateSync.bind(fs),
+  unlinkSync = fs.unlinkSync.bind(fs),
+  utimesSync = fs.utimesSync.bind(fs),
+  lutimesSync = fs.lutimesSync.bind(fs),
+  rmSync = fs.rmSync.bind(fs),
+  rmdirSync = fs.rmdirSync.bind(fs),
+  Dirent = fs.Dirent,
+  Stats = fs.Stats,
+  promises = import.meta.require("node:fs/promises");
 
 function callbackify(fsFunction, args) {
   try {
@@ -117,76 +159,7 @@ function callbackify(fsFunction, args) {
   }
 }
 
-// note: this is not quite the same as how node does it
-// in some cases, node swaps around arguments or makes small tweaks to the return type
-// this is just better than nothing.
-function promisify(fsFunction) {
-  // TODO: remove variadic arguments
-  // we can use new Function() here instead
-  // based on fsFucntion.length
-  var obj = {
-    [fsFunction.name]: function (resolve, reject, args) {
-      var result;
-      try {
-        result = fsFunction.apply(fs, args);
-        args = undefined;
-      } catch (err) {
-        args = undefined;
-        reject(err);
-        return;
-      }
-
-      resolve(result);
-    },
-  };
-
-  var func = obj[fsFunction.name];
-
-  // TODO: consider @createPromiseCapabiilty intrinsic
-  return (...args) => {
-    return new Promise((resolve, reject) => {
-      func(resolve, reject, args);
-    });
-  };
-}
-
-export var accessSync = fs.accessSync.bind(fs);
-export var appendFileSync = fs.appendFileSync.bind(fs);
-export var closeSync = fs.closeSync.bind(fs);
-export var copyFileSync = fs.copyFileSync.bind(fs);
-export var existsSync = fs.existsSync.bind(fs);
-export var chownSync = fs.chownSync.bind(fs);
-export var chmodSync = fs.chmodSync.bind(fs);
-export var fchmodSync = fs.fchmodSync.bind(fs);
-export var fchownSync = fs.fchownSync.bind(fs);
-export var fstatSync = fs.fstatSync.bind(fs);
-export var fsyncSync = fs.fsyncSync.bind(fs);
-export var ftruncateSync = fs.ftruncateSync.bind(fs);
-export var futimesSync = fs.futimesSync.bind(fs);
-export var lchmodSync = fs.lchmodSync.bind(fs);
-export var lchownSync = fs.lchownSync.bind(fs);
-export var linkSync = fs.linkSync.bind(fs);
-export var lstatSync = fs.lstatSync.bind(fs);
-export var mkdirSync = fs.mkdirSync.bind(fs);
-export var mkdtempSync = fs.mkdtempSync.bind(fs);
-export var openSync = fs.openSync.bind(fs);
-export var readSync = fs.readSync.bind(fs);
-export var writeSync = fs.writeSync.bind(fs);
-export var readdirSync = fs.readdirSync.bind(fs);
-export var readFileSync = fs.readFileSync.bind(fs);
-export var writeFileSync = fs.writeFileSync.bind(fs);
-export var readlinkSync = fs.readlinkSync.bind(fs);
-export var realpathSync = fs.realpathSync.bind(fs);
-export var renameSync = fs.renameSync.bind(fs);
-export var statSync = fs.statSync.bind(fs);
-export var symlinkSync = fs.symlinkSync.bind(fs);
-export var truncateSync = fs.truncateSync.bind(fs);
-export var unlinkSync = fs.unlinkSync.bind(fs);
-export var utimesSync = fs.utimesSync.bind(fs);
-export var lutimesSync = fs.lutimesSync.bind(fs);
-export var rmSync = fs.rmSync.bind(fs);
-
-// Results from Object.keys() in Node 18
+// Results from Object.keys() in Node 1,
 // fd
 // path
 // flags
@@ -200,15 +173,11 @@ export var rmSync = fs.rmSync.bind(fs);
 // _eventsCount
 // _maxListener
 var _lazyReadStream;
-var readStreamPathFastPathSymbol = Symbol.for(
-  "Bun.Node.readStreamPathFastPath",
-);
+var readStreamPathFastPathSymbol = Symbol.for("Bun.Node.readStreamPathFastPath");
 const readStreamSymbol = Symbol.for("Bun.NodeReadStream");
 const readStreamPathOrFdSymbol = Symbol.for("Bun.NodeReadStreamPathOrFd");
 var writeStreamPathFastPathSymbol = Symbol.for("Bun.NodeWriteStreamFastPath");
-var writeStreamPathFastPathCallSymbol = Symbol.for(
-  "Bun.NodeWriteStreamFastPathCall",
-);
+var writeStreamPathFastPathCallSymbol = Symbol.for("Bun.NodeWriteStreamFastPathCall");
 var kIoDone = Symbol.for("kIoDone");
 
 function getLazyReadStream() {
@@ -216,11 +185,7 @@ function getLazyReadStream() {
     return _lazyReadStream;
   }
 
-  var {
-    Readable,
-    _getNativeReadableStreamPrototype,
-    eos: eos_,
-  } = import.meta.require("node:stream");
+  var { Readable, _getNativeReadableStreamPrototype, eos: eos_ } = import.meta.require("node:stream");
   var defaultReadStreamOptions = {
     file: undefined,
     fd: undefined,
@@ -284,10 +249,7 @@ function getLazyReadStream() {
         if (pathOrFd.length === 0) {
           throw new TypeError("Expected path to be a non-empty string");
         }
-        tempThis.path =
-          tempThis.file =
-          tempThis[readStreamPathOrFdSymbol] =
-            pathOrFd;
+        tempThis.path = tempThis.file = tempThis[readStreamPathOrFdSymbol] = pathOrFd;
       } else if (typeof pathOrFd === "number") {
         pathOrFd |= 0;
         if (pathOrFd < 0) {
@@ -375,7 +337,11 @@ function getLazyReadStream() {
     [readStreamPathFastPathSymbol];
 
     _construct(callback) {
-      super._construct(callback);
+      if (super._construct) {
+        super._construct(callback);
+      } else {
+        callback();
+      }
       this.emit("open", this.fd);
       this.emit("ready");
     }
@@ -389,7 +355,7 @@ function getLazyReadStream() {
         if (!fd) {
           cb(err);
         } else {
-          this.#fs.close(fd, (er) => {
+          this.#fs.close(fd, er => {
             cb(er || err);
           });
           this.fd = null;
@@ -499,7 +465,7 @@ function getLazyReadStream() {
                 this.emit(kIoDone);
               }
             },
-            (er) => {
+            er => {
               this[kIoDone] = true;
               this.#errorOrDestroy(er);
             },
@@ -545,15 +511,8 @@ function getLazyReadStream() {
     }
 
     pipe(dest, pipeOpts) {
-      if (
-        this[readStreamPathFastPathSymbol] &&
-        (pipeOpts?.end ?? true) &&
-        this._readableState?.pipes?.length === 0
-      ) {
-        if (
-          writeStreamPathFastPathSymbol in dest &&
-          dest[writeStreamPathFastPathSymbol]
-        ) {
+      if (this[readStreamPathFastPathSymbol] && (pipeOpts?.end ?? true) && this._readableState?.pipes?.length === 0) {
+        if (writeStreamPathFastPathSymbol in dest && dest[writeStreamPathFastPathSymbol]) {
           if (dest[writeStreamPathFastPathCallSymbol](this, pipeOpts)) {
             return this;
           }
@@ -571,9 +530,9 @@ var internalCreateReadStream = function createReadStream(path, options) {
   const ReadStream = getLazyReadStream();
   return new ReadStream(path, options);
 };
-export var createReadStream = internalCreateReadStream;
 
 var _lazyWriteStream;
+export var createReadStream = internalCreateReadStream;
 
 function getLazyWriteStream() {
   if (_lazyWriteStream) return _lazyWriteStream;
@@ -682,12 +641,7 @@ function getLazyWriteStream() {
 
       if (encoding !== defaultWriteStreamOptions.encoding) {
         this.setDefaultEncoding(encoding);
-        if (
-          encoding !== "buffer" &&
-          encoding !== "utf8" &&
-          encoding !== "utf-8" &&
-          encoding !== "binary"
-        ) {
+        if (encoding !== "buffer" && encoding !== "utf8" && encoding !== "utf-8" && encoding !== "binary") {
           this[writeStreamPathFastPathSymbol] = false;
         }
       }
@@ -728,18 +682,15 @@ function getLazyWriteStream() {
 
       this[kIoDone] = false;
       readStream[kIoDone] = false;
-      return Bun.write(
-        this[writeStreamPathFastPathSymbol],
-        readStream[readStreamPathOrFdSymbol],
-      ).then(
-        (bytesWritten) => {
+      return Bun.write(this[writeStreamPathFastPathSymbol], readStream[readStreamPathOrFdSymbol]).then(
+        bytesWritten => {
           readStream[kIoDone] = this[kIoDone] = true;
           this.bytesWritten += bytesWritten;
           readStream.bytesRead += bytesWritten;
           this.end();
           readStream.close();
         },
-        (err) => {
+        err => {
           readStream[kIoDone] = this[kIoDone] = true;
           this.#errorOrDestroy(err);
           readStream.emit("error", err);
@@ -766,7 +717,7 @@ function getLazyWriteStream() {
     #internalClose(err, cb) {
       this[writeStreamPathFastPathSymbol] = false;
       var fd = this.fd;
-      this.#fs.close(fd, (er) => {
+      this.#fs.close(fd, er => {
         this.fd = null;
         cb(err || er);
       });
@@ -843,20 +794,13 @@ function getLazyWriteStream() {
     }
 
     #internalWriteSlow(chunk, encoding, cb) {
-      this.#fs.write(
-        this.fd,
-        chunk,
-        0,
-        chunk.length,
-        this.pos,
-        (err, bytes) => {
-          this[kIoDone] = false;
-          this.#handleWrite(err, bytes);
-          this.emit(kIoDone);
+      this.#fs.write(this.fd, chunk, 0, chunk.length, this.pos, (err, bytes) => {
+        this[kIoDone] = false;
+        this.#handleWrite(err, bytes);
+        this.emit(kIoDone);
 
-          !err ? cb() : cb(err);
-        },
-      );
+        !err ? cb() : cb(err);
+      });
     }
 
     end(chunk, encoding, cb) {
@@ -908,45 +852,6 @@ Object.defineProperties(fs, {
   },
 });
 
-export var promises = {
-  access: promisify(fs.accessSync),
-  appendFile: promisify(fs.appendFileSync),
-  chmod: promisify(fs.chmodSync),
-  chown: promisify(fs.chownSync),
-  close: promisify(fs.closeSync),
-  copyFile: promisify(fs.copyFileSync),
-  exists: promisify(fs.existsSync),
-  fchmod: promisify(fs.fchmodSync),
-  fchown: promisify(fs.fchownSync),
-  fstat: promisify(fs.fstatSync),
-  fsync: promisify(fs.fsyncSync),
-  ftruncate: promisify(fs.ftruncateSync),
-  futimes: promisify(fs.futimesSync),
-  lchmod: promisify(fs.lchmodSync),
-  lchown: promisify(fs.lchownSync),
-  link: promisify(fs.linkSync),
-  lstat: promisify(fs.lstatSync),
-  lutimes: promisify(fs.lutimesSync),
-  mkdir: promisify(fs.mkdirSync),
-  mkdtemp: promisify(fs.mkdtempSync),
-  open: promisify(fs.openSync),
-  read: promisify(fs.readSync),
-  readdir: promisify(fs.readdirSync),
-  readlink: promisify(fs.readlinkSync),
-  realpath: promisify(fs.realpathSync),
-  rename: promisify(fs.renameSync),
-  rm: promisify(fs.rmSync),
-  stat: promisify(fs.statSync),
-  symlink: promisify(fs.symlinkSync),
-  truncate: promisify(fs.truncateSync),
-  unlink: promisify(fs.unlinkSync),
-  utimes: promisify(fs.utimesSync),
-  write: promisify(fs.writeSync),
-  writeFile: promisify(fs.writeFileSync),
-};
-
-promises.readFile = promises.readfile = promisify(fs.readFileSync);
-
 // lol
 realpath.native = realpath;
 realpathSync.native = realpathSync;
@@ -968,6 +873,7 @@ export default {
   copyFileSync,
   createReadStream,
   createWriteStream,
+  Dirent,
   exists,
   existsSync,
   fchmod,
@@ -1013,8 +919,11 @@ export default {
   renameSync,
   rm,
   rmSync,
+  rmdir,
+  rmdirSync,
   stat,
   statSync,
+  Stats,
   symlink,
   symlinkSync,
   truncate,

@@ -27,13 +27,11 @@ import assert from "assert";
 // const context = require('vm').runInNewContext; // TODO: Use a vm polyfill
 
 const strictEqual = (...args) => {
-  assert.strictEqual(...args);
-  expect(true).toBe(true);
+  expect(args[0]).toStrictEqual(args[1]);
 };
 
 const deepStrictEqual = (...args) => {
-  assert.deepStrictEqual(...args);
-  expect(true).toBe(true);
+  expect(args[0]).toEqual(args[1]);
 };
 
 // Tests adapted from https://github.com/nodejs/node/blob/main/test/parallel/test-util.js
@@ -234,10 +232,7 @@ describe("util", () => {
       //     true
       //   );
       strictEqual(util.types.isNativeError({}), false);
-      strictEqual(
-        util.types.isNativeError({ name: "Error", message: "" }),
-        false,
-      );
+      strictEqual(util.types.isNativeError({ name: "Error", message: "" }), false);
       strictEqual(util.types.isNativeError([]), false);
       //   strictEqual( // FIXME: failing test
       //     util.types.isNativeError(Object.create(Error.prototype)),

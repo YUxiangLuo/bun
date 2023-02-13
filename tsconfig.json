@@ -2,7 +2,6 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "experimentalDecorators": true,
-    "allowSyntheticDefaultImports": true,
     "noEmit": true,
     // "skipLibCheck": true,
     "allowJs": true
@@ -23,6 +22,7 @@
     "src/bun.js/builtins",
     "src/api/demo",
     "test/snapshots",
-    "test/snapshots-no-hmr"
+    "test/snapshots-no-hmr",
+    "node_modules"
   ]
 }

@@ -1,13 +1,9 @@
-import {
-  file,
-  readableStreamToArrayBuffer,
-  readableStreamToArray,
-  readableStreamToText,
-} from "bun";
+import { file, readableStreamToArrayBuffer, readableStreamToArray, readableStreamToText } from "bun";
 import { expect, it, beforeEach, afterEach, describe } from "bun:test";
 import { mkfifo } from "mkfifo";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "os";
 import { gc } from "./gc";
 
 beforeEach(() => gc());
@@ -39,14 +35,30 @@ describe("WritableStream", () => {
 
       await writer.close();
 
-      expect(JSON.stringify(Array.from(Buffer.concat(chunks)))).toBe(
-        JSON.stringify([1, 2, 3, 4, 5, 6]),
-      );
+      expect(JSON.stringify(Array.from(Buffer.concat(chunks)))).toBe(JSON.stringify([1, 2, 3, 4, 5, 6]));
     } catch (e) {
       console.log(e);
       console.log(e.stack);
       throw e;
     }
+  });
+
+  it("pipeTo", async () => {
+    const rs = new ReadableStream({
+      start(controller) {
+        controller.enqueue("hello world");
+        controller.close();
+      },
+    });
+
+    let received;
+    const ws = new WritableStream({
+      write(chunk, controller) {
+        received = chunk;
+      },
+    });
+    await rs.pipeTo(ws);
+    expect(received).toBe("hello world");
   });
 });
 
@@ -227,11 +239,7 @@ it("Bun.file() read text from pipe", async () => {
   const chunks = [];
 
   const proc = Bun.spawn({
-    cmd: [
-      "bash",
-      join(import.meta.dir + "/", "bun-streams-test-fifo.sh"),
-      "/tmp/fifo",
-    ],
+    cmd: ["bash", join(import.meta.dir + "/", "bun-streams-test-fifo.sh"), "/tmp/fifo"],
     stderr: "inherit",
     stdout: null,
     stdin: null,
@@ -445,9 +453,7 @@ it("ReadableStream for Blob", async () => {
     if (chunk.done) break;
     chunks.push(new TextDecoder().decode(chunk.value));
   }
-  expect(chunks.join("")).toBe(
-    new TextDecoder().decode(Buffer.from("abdefghijklmnop")),
-  );
+  expect(chunks.join("")).toBe(new TextDecoder().decode(Buffer.from("abdefghijklmnop")));
 });
 
 it("ReadableStream for File", async () => {
@@ -463,7 +469,7 @@ it("ReadableStream for File", async () => {
   }
   reader = undefined;
   const output = new Uint8Array(await blob.arrayBuffer()).join("");
-  const input = chunks.map((a) => a.join("")).join("");
+  const input = chunks.map(a => a.join("")).join("");
   expect(output).toBe(input);
 });
 
@@ -604,4 +610,21 @@ it("Blob.stream() -> new Response(stream).text()", async () => {
   var stream = blob.stream();
   const text = await new Response(stream).text();
   expect(text).toBe("abdefgh");
+});
+
+it("Bun.file().stream() read text from large file", async () => {
+  const hugely = "HELLO!".repeat(1024 * 1024 * 10);
+  const tmpfile = join(realpathSync(tmpdir()), "bun-streams-test.txt");
+  writeFileSync(tmpfile, hugely);
+  try {
+    const chunks = [];
+    for await (const chunk of Bun.file(tmpfile).stream()) {
+      chunks.push(chunk);
+    }
+    const output = Buffer.concat(chunks).toString();
+    expect(output).toHaveLength(hugely.length);
+    expect(output).toBe(hugely);
+  } finally {
+    unlinkSync(tmpfile);
+  }
 });

@@ -297,6 +297,20 @@ extern "C"
     }
   }
 
+  void uws_app_close(int ssl, uws_app_t *app)
+  {
+    if (ssl)
+    {
+      uWS::SSLApp *uwsApp = (uWS::SSLApp *)app;
+      uwsApp->close();
+    }
+    else
+    {
+      uWS::App *uwsApp = (uWS::App *)app;
+      uwsApp->close();
+    }
+  }
+
   void uws_app_listen(int ssl, uws_app_t *app, int port,
                       uws_listen_handler handler, void *user_data)
   {
@@ -1262,7 +1276,7 @@ extern "C"
     return uwsReq->getYield();
   }
 
-  void uws_req_set_field(uws_req_t *res, bool yield)
+  void uws_req_set_yield(uws_req_t *res, bool yield)
   {
     uWS::HttpRequest *uwsReq = (uWS::HttpRequest *)res;
     return uwsReq->setYield(yield);
@@ -1332,6 +1346,17 @@ extern "C"
                        size_t sec_web_socket_extensions_length,
                        uws_socket_context_t *ws)
   {
+    if (ssl) {
+    uWS::HttpResponse<true> *uwsRes = (uWS::HttpResponse<true> *)res;
+
+    uwsRes->template upgrade<void *>(
+        data ? std::move(data) : NULL,
+        std::string_view(sec_web_socket_key, sec_web_socket_key_length),
+        std::string_view(sec_web_socket_protocol, sec_web_socket_protocol_length),
+        std::string_view(sec_web_socket_extensions,
+                         sec_web_socket_extensions_length),
+        (struct us_socket_context_t *)ws);
+    } else {
     uWS::HttpResponse<false> *uwsRes = (uWS::HttpResponse<false> *)res;
 
     uwsRes->template upgrade<void *>(
@@ -1341,6 +1366,7 @@ extern "C"
         std::string_view(sec_web_socket_extensions,
                          sec_web_socket_extensions_length),
         (struct us_socket_context_t *)ws);
+    }
   }
 
   struct us_loop_t *uws_get_loop()
@@ -1436,9 +1462,10 @@ extern "C"
     {
       uWS::HttpResponse<true> *uwsRes = (uWS::HttpResponse<true> *)res;
       uwsRes->setWriteOffset(offset); //TODO: when updated to master this will bechanged to overrideWriteOffset
+    } else {
+      uWS::HttpResponse<false> *uwsRes = (uWS::HttpResponse<false> *)res;
+      uwsRes->setWriteOffset(offset); //TODO: when updated to master this will bechanged to overrideWriteOffset
     }
-    uWS::HttpResponse<false> *uwsRes = (uWS::HttpResponse<false> *)res;
-    uwsRes->setWriteOffset(offset); //TODO: when updated to master this will bechanged to overrideWriteOffset
   }
   
   void uws_res_cork(int ssl, uws_res_t *res, void *ctx,

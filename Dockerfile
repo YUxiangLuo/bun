@@ -7,16 +7,20 @@ ARG BUN_DEPS_OUT_DIR=${GITHUB_WORKSPACE}/bun-deps
 ARG BUN_DIR=${GITHUB_WORKSPACE}/bun
 ARG CPU_TARGET=native
 ARG ARCH=x86_64
+ARG BUILD_MACHINE_ARCH=x86_64
 ARG TRIPLET=${ARCH}-linux-gnu
 ARG BUILDARCH=amd64
-ARG WEBKIT_TAG=jul27-2
+ARG WEBKIT_TAG=feb9
 ARG ZIG_TAG=jul1
+ARG ZIG_VERSION="0.11.0-dev.1393+38eebf3c4"
 ARG WEBKIT_BASENAME="bun-webkit-linux-$BUILDARCH"
-ARG WEBKIT_URL="https://github.com/oven-sh/WebKit/releases/download/$WEBKIT_TAG/${WEBKIT_BASENAME}.tar.gz"
 
-ARG ZIG_URL="https://github.com/oven-sh/zig/releases/download/$ZIG_TAG/zig-linux-$BUILDARCH.zip"
+ARG ZIG_FOLDERNAME=zig-linux-${BUILD_MACHINE_ARCH}-${ZIG_VERSION}
+ARG ZIG_FILENAME=${ZIG_FOLDERNAME}.tar.xz
+ARG WEBKIT_URL="https://github.com/oven-sh/WebKit/releases/download/$WEBKIT_TAG/${WEBKIT_BASENAME}.tar.gz"
+ARG ZIG_URL="https://ziglang.org/builds/${ZIG_FILENAME}"
 ARG GIT_SHA=""
-ARG BUN_BASE_VERSION=0.3
+ARG BUN_BASE_VERSION=0.5
 
 FROM bitnami/minideb:bullseye as bun-base
 
@@ -24,7 +28,7 @@ RUN install_packages ca-certificates curl wget lsb-release software-properties-c
 
 RUN wget https://apt.llvm.org/llvm.sh && \
     chmod +x llvm.sh && \
-    ./llvm.sh 13
+    ./llvm.sh 15
 
 RUN install_packages \
     cmake \
@@ -42,10 +46,11 @@ RUN install_packages \
     rsync \
     ruby \
     unzip \
+    xz-utils \
     bash tar gzip ccache
 
-ENV CXX=clang++-13
-ENV CC=clang-13
+ENV CXX=clang++-15
+ENV CC=clang-15
 
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
     install_packages nodejs && \
@@ -62,13 +67,15 @@ ARG BUILDARCH
 ARG ZIG_PATH
 ARG WEBKIT_URL
 ARG ZIG_URL
+ARG ZIG_FOLDERNAME
+ARG ZIG_FILENAME
 
 ENV WEBKIT_OUT_DIR=${WEBKIT_DIR}
 ENV BUILDARCH=${BUILDARCH}
-ENV AR=/usr/bin/llvm-ar-13
+ENV AR=/usr/bin/llvm-ar-15
 ENV ZIG "${ZIG_PATH}/zig"
 ENV PATH="$ZIG/bin:$PATH"
-ENV LD=lld-13
+ENV LD=lld-15
 
 RUN mkdir -p $BUN_DIR $BUN_DEPS_OUT_DIR 
 
@@ -77,8 +84,8 @@ FROM bun-base as bun-base-with-zig-and-webkit
 WORKDIR $GITHUB_WORKSPACE
 
 ADD $ZIG_URL .
-RUN unzip -q zig-linux-$BUILDARCH.zip && \
-    rm zig-linux-$BUILDARCH.zip;
+RUN tar xf ${ZIG_FILENAME} && \
+    rm ${ZIG_FILENAME} && mv ${ZIG_FOLDERNAME} zig;
 
 
 
@@ -104,6 +111,30 @@ RUN mkdir -p ${WEBKIT_DIR} && cd ${GITHUB_WORKSPACE} && \
 LABEL org.opencontainers.image.title="bun base image with zig & webkit ${BUILDARCH} (glibc)"
 LABEL org.opencontainers.image.source=https://github.com/oven-sh/bun
 
+FROM bun-base as c-ares
+
+ARG DEBIAN_FRONTEND
+ARG GITHUB_WORKSPACE
+ARG ZIG_PATH
+# Directory extracts to "bun-webkit"
+ARG WEBKIT_DIR
+ARG BUN_RELEASE_DIR
+ARG BUN_DEPS_OUT_DIR
+ARG BUN_DIR
+ARG CPU_TARGET
+ENV CPU_TARGET=${CPU_TARGET}
+
+ENV CCACHE_DIR=/ccache
+ENV JSC_BASE_DIR=${WEBKIT_DIR}
+ENV LIB_ICU_PATH=${WEBKIT_DIR}/lib
+
+COPY Makefile ${BUN_DIR}/Makefile
+COPY src/deps/c-ares ${BUN_DIR}/src/deps/c-ares
+
+WORKDIR $BUN_DIR
+
+RUN --mount=type=cache,target=/ccache cd $BUN_DIR && make c-ares && rm -rf ${BUN_DIR}/src/deps/c-ares ${BUN_DIR}/Makefile
+
 
 FROM bun-base as lolhtml
 
@@ -118,12 +149,15 @@ ARG BUN_RELEASE_DIR
 ARG BUN_DEPS_OUT_DIR
 ARG BUN_DIR
 
+ARG CPU_TARGET
+ENV CPU_TARGET=${CPU_TARGET}
+
 COPY Makefile ${BUN_DIR}/Makefile
 COPY src/deps/lol-html ${BUN_DIR}/src/deps/lol-html
 
 ENV CCACHE_DIR=/ccache
 
-RUN --mount=type=cache,target=/ccache export PATH=$PATH:$HOME/.cargo/bin && export CC=$(which clang-13) && cd ${BUN_DIR} && \
+RUN --mount=type=cache,target=/ccache export PATH=$PATH:$HOME/.cargo/bin && export CC=$(which clang-15) && cd ${BUN_DIR} && \
     make lolhtml && rm -rf src/deps/lol-html Makefile
 
 FROM bun-base as mimalloc
@@ -195,29 +229,7 @@ WORKDIR $BUN_DIR
 RUN --mount=type=cache,target=/ccache cd $BUN_DIR && \
     make libarchive && rm -rf src/deps/libarchive Makefile
 
-FROM bun-base as oniguruma
 
-ARG DEBIAN_FRONTEND
-ARG GITHUB_WORKSPACE
-ARG ZIG_PATH
-# Directory extracts to "bun-webkit"
-ARG WEBKIT_DIR
-ARG BUN_RELEASE_DIR
-ARG BUN_DEPS_OUT_DIR
-ARG BUN_DIR
-ARG CPU_TARGET
-ENV CPU_TARGET=${CPU_TARGET}
-
-RUN install_packages autoconf automake libtool pkg-config 
-
-COPY Makefile ${BUN_DIR}/Makefile
-COPY src/deps/oniguruma ${BUN_DIR}/src/deps/oniguruma
-
-ENV CCACHE_DIR=/ccache
-
-WORKDIR $BUN_DIR
-
-RUN --mount=type=cache,target=/ccache cd ${BUN_DIR} && make oniguruma && rm -rf src/deps/oniguruma Makefile
 
 FROM bun-base as tinycc
 
@@ -294,7 +306,6 @@ ARG BUN_RELEASE_DIR
 ARG BUN_DEPS_OUT_DIR
 ARG BUN_DIR
 ARG CPU_TARGET
-
 ENV CPU_TARGET=${CPU_TARGET}
 
 COPY Makefile ${BUN_DIR}/Makefile
@@ -366,11 +377,12 @@ ENV CPU_TARGET=${CPU_TARGET}
 
 WORKDIR $BUN_DIR
 
+COPY ./root.zig ${BUN_DIR}/root.zig
 COPY ./src ${BUN_DIR}/src
 COPY ./build.zig ${BUN_DIR}/build.zig
 COPY ./completions ${BUN_DIR}/completions
 COPY ./packages ${BUN_DIR}/packages
-COPY ./build-id ${BUN_DIR}/build-id
+COPY ./src/build-id ${BUN_DIR}/src/build-id
 COPY ./package.json ${BUN_DIR}/package.json
 COPY ./misctools ${BUN_DIR}/misctools
 COPY Makefile ${BUN_DIR}/Makefile
@@ -408,14 +420,14 @@ ENV GIT_SHA=${GIT_SHA}
 COPY --from=identifier_cache ${BUN_DIR}/src/js_lexer/*.blob ${BUN_DIR}/src/js_lexer/
 COPY --from=node_fallbacks ${BUN_DIR}/src/node-fallbacks/out ${BUN_DIR}/src/node-fallbacks/out
 
-COPY ./build-id ${BUN_DIR}/build-id
+COPY ./src/build-id ${BUN_DIR}/src/build-id
 
 ENV CCACHE_DIR=/ccache
 
 RUN --mount=type=cache,target=/ccache cd $BUN_DIR && mkdir -p src/bun.js/bindings-obj &&  rm -rf $HOME/.cache zig-cache && make prerelease && \
     mkdir -p $BUN_RELEASE_DIR && \
-    OUTPUT_DIR=/tmp $ZIG_PATH/zig build obj -Drelease-fast -Dtarget="${TRIPLET}" -Dcpu="${CPU_TARGET}" && \
-    cp /tmp/bun.o /tmp/bun-${BUN_BASE_VERSION}.$(cat ${BUN_DIR}/build-id).o && cd / && rm -rf $BUN_DIR
+    OUTPUT_DIR=/tmp/bun-${TRIPLET}-${GIT_SHA} $ZIG_PATH/zig build obj -Doutput-dir=/tmp/bun-${TRIPLET}-${GIT_SHA} -Drelease-fast -Dtarget="${TRIPLET}" -Dcpu="${CPU_TARGET}" && \
+    cp /tmp/bun-${TRIPLET}-${GIT_SHA}/bun.o /tmp/bun-${TRIPLET}-${GIT_SHA}/bun-${BUN_BASE_VERSION}.$(cat ${BUN_DIR}/src/build-id).o && cd / && rm -rf $BUN_DIR
 
 FROM scratch as build_release_obj
 
@@ -426,12 +438,13 @@ ARG ZIG_PATH
 ARG WEBKIT_DIR
 ARG BUN_RELEASE_DIR
 ARG BUN_DEPS_OUT_DIR
+ARG GIT_SHA
+ARG TRIPLET
 ARG BUN_DIR
 ARG CPU_TARGET
 ENV CPU_TARGET=${CPU_TARGET}
 
-
-COPY --from=compile_release_obj /tmp/*.o /
+COPY --from=compile_release_obj /tmp/bun-${TRIPLET}-${GIT_SHA}/*.o /
 
 FROM prepare_release as compile_cpp
 
@@ -453,17 +466,6 @@ WORKDIR $BUN_DIR
 ENV JSC_BASE_DIR=${WEBKIT_DIR}
 ENV LIB_ICU_PATH=${WEBKIT_DIR}/lib
 
-COPY --from=boringssl ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
-COPY --from=zlib ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
-COPY --from=lolhtml ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
-COPY --from=mimalloc ${BUN_DEPS_OUT_DIR}/*.o ${BUN_DEPS_OUT_DIR}/
-COPY --from=libarchive ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
-COPY --from=oniguruma ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
-COPY --from=picohttp ${BUN_DEPS_OUT_DIR}/*.o ${BUN_DEPS_OUT_DIR}/
-COPY --from=uws ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
-COPY --from=uws ${BUN_DEPS_OUT_DIR}/*.o ${BUN_DEPS_OUT_DIR}/
-COPY --from=tinycc ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
-
 # Required for `make webcrypto`
 COPY src/deps/boringssl/include ${BUN_DIR}/src/deps/boringssl/include
 
@@ -472,7 +474,7 @@ ENV CCACHE_DIR=/ccache
 RUN --mount=type=cache,target=/ccache cd $BUN_DIR && mkdir -p src/bun.js/bindings-obj &&  rm -rf $HOME/.cache zig-cache && mkdir -p $BUN_RELEASE_DIR && make webcrypto && \
     make release-bindings -j10 && mv ${BUN_DEPS_OUT_DIR}/libwebcrypto.a /tmp && mv src/bun.js/bindings-obj/* /tmp
 
-FROM prepare_release as sqlite
+FROM bun-base as sqlite
 
 ARG DEBIAN_FRONTEND
 ARG GITHUB_WORKSPACE
@@ -483,14 +485,20 @@ ARG BUN_RELEASE_DIR
 ARG BUN_DEPS_OUT_DIR
 ARG BUN_DIR
 
+ARG CPU_TARGET
+ENV CPU_TARGET=${CPU_TARGET}
+
+ENV CCACHE_DIR=/ccache
+
 COPY Makefile ${BUN_DIR}/Makefile
+COPY src/bun.js/bindings/sqlite ${BUN_DIR}/src/bun.js/bindings/sqlite
 
 WORKDIR $BUN_DIR
 
 ENV JSC_BASE_DIR=${WEBKIT_DIR}
 ENV LIB_ICU_PATH=${WEBKIT_DIR}/lib
 
-RUN cd $BUN_DIR && make sqlite
+RUN --mount=type=cache,target=/ccache cd $BUN_DIR && make sqlite
 
 FROM scratch as build_release_cpp
 
@@ -522,12 +530,13 @@ COPY --from=libarchive ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
 COPY --from=boringssl ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
 COPY --from=lolhtml ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
 COPY --from=mimalloc ${BUN_DEPS_OUT_DIR}/*.o ${BUN_DEPS_OUT_DIR}/
-COPY --from=oniguruma ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
 COPY --from=picohttp ${BUN_DEPS_OUT_DIR}/*.o ${BUN_DEPS_OUT_DIR}/
 COPY --from=sqlite ${BUN_DEPS_OUT_DIR}/*.o  ${BUN_DEPS_OUT_DIR}/
 COPY --from=tinycc ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
 COPY --from=uws ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
 COPY --from=uws ${BUN_DEPS_OUT_DIR}/*.o ${BUN_DEPS_OUT_DIR}/
+COPY --from=c-ares ${BUN_DEPS_OUT_DIR}/*.a ${BUN_DEPS_OUT_DIR}/
+
 COPY --from=build_release_obj /*.o /tmp
 COPY --from=build_release_cpp /*.o ${BUN_DIR}/src/bun.js/bindings-obj/
 COPY --from=build_release_cpp /*.a ${BUN_DEPS_OUT_DIR}/

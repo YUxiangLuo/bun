@@ -61,40 +61,7 @@ pub const Subprocess = struct {
     is_sync: bool = false,
     this_jsvalue: JSC.JSValue = .zero,
 
-    pub const SignalCode = enum(u8) {
-        SIGHUP = 1,
-        SIGINT = 2,
-        SIGQUIT = 3,
-        SIGILL = 4,
-        SIGTRAP = 5,
-        SIGABRT = 6,
-        SIGBUS = 7,
-        SIGFPE = 8,
-        SIGKILL = 9,
-        SIGUSR1 = 10,
-        SIGSEGV = 11,
-        SIGUSR2 = 12,
-        SIGPIPE = 13,
-        SIGALRM = 14,
-        SIGTERM = 15,
-        SIG16 = 16,
-        SIGCHLD = 17,
-        SIGCONT = 18,
-        SIGSTOP = 19,
-        SIGTSTP = 20,
-        SIGTTIN = 21,
-        SIGTTOU = 22,
-        SIGURG = 23,
-        SIGXCPU = 24,
-        SIGXFSZ = 25,
-        SIGVTALRM = 26,
-        SIGPROF = 27,
-        SIGWINCH = 28,
-        SIGIO = 29,
-        SIGPWR = 30,
-        SIGSYS = 31,
-        _,
-    };
+    pub const SignalCode = bun.SignalCode;
 
     pub fn hasExited(this: *const Subprocess) bool {
         return this.exit_code != null or this.waitpid_err != null or this.signal_code != null;
@@ -167,7 +134,7 @@ pub const Subprocess = struct {
                 .pipe => {
                     if (this.pipe == .buffer) {
                         if (this.pipe.buffer.fifo.poll_ref) |poll| {
-                            poll.enableKeepingProcessAlive(JSC.VirtualMachine.vm);
+                            poll.enableKeepingProcessAlive(JSC.VirtualMachine.get());
                         }
                     }
                 },
@@ -180,7 +147,7 @@ pub const Subprocess = struct {
                 .pipe => {
                     if (this.pipe == .buffer) {
                         if (this.pipe.buffer.fifo.poll_ref) |poll| {
-                            poll.disableKeepingProcessAlive(JSC.VirtualMachine.vm);
+                            poll.disableKeepingProcessAlive(JSC.VirtualMachine.get());
                         }
                     }
                 },
@@ -555,7 +522,7 @@ pub const Subprocess = struct {
                             },
                         );
 
-                        this.remain = this.remain[@minimum(bytes_written, this.remain.len)..];
+                        this.remain = this.remain[@min(bytes_written, this.remain.len)..];
                         to_write = to_write[bytes_written..];
 
                         // we are done or it accepts no more input
@@ -795,7 +762,7 @@ pub const Subprocess = struct {
             switch (this.*) {
                 .pipe => {
                     if (this.pipe.poll_ref) |poll| {
-                        poll.enableKeepingProcessAlive(JSC.VirtualMachine.vm);
+                        poll.enableKeepingProcessAlive(JSC.VirtualMachine.get());
                     }
                 },
                 else => {},
@@ -806,7 +773,7 @@ pub const Subprocess = struct {
             switch (this.*) {
                 .pipe => {
                     if (this.pipe.poll_ref) |poll| {
-                        poll.disableKeepingProcessAlive(JSC.VirtualMachine.vm);
+                        poll.disableKeepingProcessAlive(JSC.VirtualMachine.get());
                     }
                 },
                 else => {},
@@ -829,7 +796,7 @@ pub const Subprocess = struct {
                     var sink = try globalThis.bunVM().allocator.create(JSC.WebCore.FileSink);
                     sink.* = .{
                         .fd = fd,
-                        .buffer = bun.ByteList.init(&.{}),
+                        .buffer = bun.ByteList{},
                         .allocator = globalThis.bunVM().allocator,
                         .auto_close = true,
                     };
@@ -989,11 +956,10 @@ pub const Subprocess = struct {
         global: *JSGlobalObject,
     ) callconv(.C) JSValue {
         if (this.signal_code) |signal| {
-            const value = @enumToInt(signal);
-            if (value < @enumToInt(SignalCode.SIGSYS) + 1)
-                return JSC.ZigString.init(std.mem.span(@tagName(signal))).toValueGC(global)
+            if (signal.name()) |name|
+                return JSC.ZigString.init(name).toValueGC(global)
             else
-                return JSC.JSValue.jsNumber(value);
+                return JSC.JSValue.jsNumber(@enumToInt(signal));
         }
 
         return JSC.JSValue.jsNull();
@@ -1028,7 +994,7 @@ pub const Subprocess = struct {
         var cwd = jsc_vm.bundler.fs.top_level_dir;
 
         var stdio = [3]Stdio{
-            .{ .ignore = .{} },
+            .{ .ignore = {} },
             .{ .pipe = null },
             .{ .inherit = {} },
         };
@@ -1167,7 +1133,7 @@ pub const Subprocess = struct {
                     if (!stdio_val.isEmptyOrUndefinedOrNull()) {
                         if (stdio_val.jsType().isArray()) {
                             var stdio_iter = stdio_val.arrayIterator(globalThis);
-                            stdio_iter.len = @minimum(stdio_iter.len, 3);
+                            stdio_iter.len = @min(stdio_iter.len, 3);
                             var i: usize = 0;
                             while (stdio_iter.next()) |value| : (i += 1) {
                                 if (!extractStdio(globalThis, i, value, &stdio))
@@ -1229,17 +1195,17 @@ pub const Subprocess = struct {
         }
 
         const stdin_pipe = if (stdio[0].isPiped()) os.pipe2(0) catch |err| {
-            globalThis.throw("failed to create stdin pipe: {s}", .{err});
+            globalThis.throw("failed to create stdin pipe: {s}", .{@errorName(err)});
             return .zero;
         } else undefined;
 
         const stdout_pipe = if (stdio[1].isPiped()) os.pipe2(0) catch |err| {
-            globalThis.throw("failed to create stdout pipe: {s}", .{err});
+            globalThis.throw("failed to create stdout pipe: {s}", .{@errorName(err)});
             return .zero;
         } else undefined;
 
         const stderr_pipe = if (stdio[2].isPiped()) os.pipe2(0) catch |err| {
-            globalThis.throw("failed to create stderr pipe: {s}", .{err});
+            globalThis.throw("failed to create stderr pipe: {s}", .{@errorName(err)});
             return .zero;
         } else undefined;
 
@@ -1550,12 +1516,12 @@ pub const Subprocess = struct {
         if (this.hasExited()) {
             if (this.exit_promise.trySwap()) |promise| {
                 if (this.exit_code) |code| {
-                    promise.asPromise().?.resolve(globalThis, JSValue.jsNumber(code));
+                    promise.asAnyPromise().?.resolve(globalThis, JSValue.jsNumber(code));
                 } else if (this.signal_code != null) {
-                    promise.asPromise().?.resolve(globalThis, this.getSignalCode(globalThis));
+                    promise.asAnyPromise().?.resolve(globalThis, this.getSignalCode(globalThis));
                 } else if (this.waitpid_err) |err| {
                     this.waitpid_err = null;
-                    promise.asPromise().?.reject(globalThis, err.toJSC(globalThis));
+                    promise.asAnyPromise().?.reject(globalThis, err.toJSC(globalThis));
                 } else {
                     // crash in debug mode
                     if (comptime Environment.allow_assert)
@@ -1587,7 +1553,7 @@ pub const Subprocess = struct {
                 &args,
             );
 
-            if (result.isAnyError(globalThis)) {
+            if (result.isAnyError()) {
                 globalThis.bunVM().onUnhandledError(globalThis, result);
             }
         }
@@ -1762,7 +1728,8 @@ pub const Subprocess = struct {
         } else if (value.as(JSC.WebCore.Response)) |req| {
             req.getBodyValue().toBlobIfPossible();
             return extractStdioBlob(globalThis, req.getBodyValue().useAsAnyBlob(), i, stdio_array);
-        } else if (JSC.WebCore.ReadableStream.fromJS(value, globalThis)) |*req| {
+        } else if (JSC.WebCore.ReadableStream.fromJS(value, globalThis)) |req_const| {
+            var req = req_const;
             if (i == std.os.STDIN_FILENO) {
                 if (req.toAnyBlob(globalThis)) |blob| {
                     return extractStdioBlob(globalThis, blob, i, stdio_array);
@@ -1776,7 +1743,7 @@ pub const Subprocess = struct {
                             return false;
                         }
 
-                        stdio_array[i] = .{ .pipe = req.* };
+                        stdio_array[i] = .{ .pipe = req };
                         return true;
                     },
                     else => {},
